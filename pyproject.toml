@@ -1,0 +1,45 @@
+[project]
+name = "jurispeed-bcn-scraper"
+version = "1.0.0"
+description = "Professional BCN legal norms scraper for Jurispeed"
+authors = [
+    {name = "Jurispeed Team", email = "tech@jurispeed.ai"}
+]
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4==4.12.3",
+    "httpx==0.27.0",
+    "playwright==1.41.0",
+    "tenacity==8.2.3",
+    "pydantic==2.6.0",
+    "structlog==24.1.0",
+    "boto3==1.34.0",
+    "python-dotenv==1.0.0",
+    "lxml==5.1.0",
+    "click==8.1.7",
+    "opensearch-py==2.4.0",
+    "requests-aws4auth==1.2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.0.0",
+    "pytest-asyncio==0.23.0",
+    "pytest-cov==4.1.0",
+    "mypy==1.8.0",
+    "ruff==0.2.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
