@@ -35,12 +35,13 @@ class S3Storage:
         self.region = region
 
         # Initialize S3 client
-        self.client = boto3.client(
-            "s3",
-            region_name=region,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-        )
+        # If keys are empty, boto3 will use IAM role (EC2 instance profile)
+        client_kwargs = {"region_name": region}
+        if aws_access_key_id and aws_secret_access_key:
+            client_kwargs["aws_access_key_id"] = aws_access_key_id
+            client_kwargs["aws_secret_access_key"] = aws_secret_access_key
+
+        self.client = boto3.client("s3", **client_kwargs)
 
         self.stats = {
             "uploaded": 0,

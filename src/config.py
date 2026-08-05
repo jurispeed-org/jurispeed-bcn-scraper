@@ -116,10 +116,12 @@ class Config(BaseModel):
         """Validate that required fields are set."""
         errors = []
 
-        if not self.aws.access_key_id:
-            errors.append("AWS_ACCESS_KEY_ID is required")
-        if not self.aws.secret_access_key:
-            errors.append("AWS_SECRET_ACCESS_KEY is required")
+        # AWS keys are optional - EC2 instances use IAM roles
+        # if not self.aws.access_key_id:
+        #     errors.append("AWS_ACCESS_KEY_ID is required")
+        # if not self.aws.secret_access_key:
+        #     errors.append("AWS_SECRET_ACCESS_KEY is required")
+
         if not self.lexintel.api_url:
             errors.append("LEXINTEL_API_URL is required")
         if not self.lexintel.username:

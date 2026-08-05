@@ -31,12 +31,13 @@ class CheckpointManager:
         self.instance_id = instance_id
 
         # Initialize DynamoDB client
-        self.dynamodb = boto3.resource(
-            "dynamodb",
-            region_name=config.region,
-            aws_access_key_id=config.access_key_id,
-            aws_secret_access_key=config.secret_access_key,
-        )
+        # If keys are empty, boto3 will use IAM role (EC2 instance profile)
+        client_kwargs = {"region_name": config.region}
+        if config.access_key_id and config.secret_access_key:
+            client_kwargs["aws_access_key_id"] = config.access_key_id
+            client_kwargs["aws_secret_access_key"] = config.secret_access_key
+
+        self.dynamodb = boto3.resource("dynamodb", **client_kwargs)
 
         self.table = self.dynamodb.Table(config.checkpoint_table)
 
