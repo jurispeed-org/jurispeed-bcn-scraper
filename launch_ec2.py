@@ -31,7 +31,7 @@ load_dotenv()
 
 # Configuration
 REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2")
-AMI_ID = "ami-05134c8ef96964280"  # Ubuntu 22.04 LTS us-west-2
+AMI_ID = "ami-0eb3161272dc9c6eb"  # Ubuntu 22.04 LTS us-west-2 (July 2026)
 INSTANCE_TYPE = "t3.small"
 KEY_NAME = None  # Will prompt or auto-detect
 SECURITY_GROUP = None  # Will use default VPC security group
@@ -187,7 +187,7 @@ apt-get update -y
 apt-get upgrade -y
 
 # Install Python 3.11
-apt-get install -y python3.11 python3.11-venv python3-pip git
+apt-get install -y python3 python3-venv python3-pip git
 
 # Install Playwright dependencies
 apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \\
@@ -204,7 +204,7 @@ cd /opt/jurispeed-scraper
 git clone {REPO_URL} .
 
 # Create virtual environment
-python3.11 -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 
 # Install dependencies
@@ -234,7 +234,7 @@ EOF
 # Create systemd service
 cat > /etc/systemd/system/jurispeed-scraper.service << 'EOF'
 [Unit]
-Description=Jurispeed BCN Scraper
+Description=Jurispeed BCN Scraper (Priority Norms)
 After=network.target
 
 [Service]
@@ -242,7 +242,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/jurispeed-scraper
 Environment="PATH=/opt/jurispeed-scraper/venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/opt/jurispeed-scraper/venv/bin/python run_scraper.py --start {start} --end {end} --instance-id {instance_id} --resume --s3-bucket {s3_bucket}
+ExecStart=/opt/jurispeed-scraper/venv/bin/python run_scraper_priority.py --instance-id {instance_id} --resume --s3-bucket {s3_bucket}
 Restart=always
 RestartSec=60
 StandardOutput=append:/var/log/jurispeed-scraper/scraper.log
@@ -377,7 +377,7 @@ def main():
     KEY_NAME = args.key
 
     print("\n" + "="*60)
-    print("🚀 Jurispeed BCN Scraper - EC2 Launcher")
+    print("Jurispeed BCN Scraper - EC2 Launcher")
     print("="*60)
 
     # Create IAM role
