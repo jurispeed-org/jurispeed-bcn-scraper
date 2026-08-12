@@ -18,11 +18,14 @@ import structlog
 import sys
 from pathlib import Path
 
-from src.config import Config
-from src.scraper_playwright import BCNPlaywrightScraper
-from src.checkpoint import CheckpointManager
-from src.s3_client import S3Storage
-from src.models import ChileanLegalNorm
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from utils.config import Config
+from core.scraper_playwright import BCNPlaywrightScraper
+from pipeline.checkpoint import CheckpointManager
+from storage.s3_client import S3Storage
+from core.models import ChileanLegalNorm
 
 # Configure structured logging
 structlog.configure(

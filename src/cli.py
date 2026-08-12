@@ -9,10 +9,10 @@ import sys
 import structlog
 import click
 from typing import Optional
-from .config import Config
-from .scraper import BCNScraper
-from .indexer import ProfessionalIndexer
-from .checkpoint import CheckpointManager
+from .utils.config import Config
+from .core.scraper import BCNScraper
+from .pipeline.indexer import ProfessionalIndexer
+from .pipeline.checkpoint import CheckpointManager
 
 # Configure structured logging
 def configure_logging(log_level: str = "INFO", log_format: str = "json"):

@@ -4,10 +4,13 @@ Test scraping a single specific norm with full details.
 import asyncio
 import sys
 import json
-sys.path.insert(0, 'src')
+from pathlib import Path
 
-from src.scraper_playwright import BCNPlaywrightScraper
-from src.config import ScraperConfig
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+
+from core.scraper_playwright import BCNPlaywrightScraper
+from utils.config import ScraperConfig
 
 
 async def test_single_norm(norm_id: int):

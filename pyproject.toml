@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "jurispeed-bcn-scraper"
 version = "1.0.0"
@@ -43,3 +47,7 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
+
+[project.scripts]
+jurispeed-scraper = "cli:main"

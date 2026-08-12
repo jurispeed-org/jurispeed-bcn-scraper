@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright, Browser, Page, TimeoutError a
 from typing import Optional
 from .models import ChileanLegalNorm, ScraperStats
 from .parser import BCNHtmlParser
-from .config import ScraperConfig
+from ..utils.config import ScraperConfig
 
 logger = structlog.get_logger()
 

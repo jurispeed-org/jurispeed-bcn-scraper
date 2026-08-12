@@ -319,13 +319,4 @@ aws dynamodb delete-table \
 
 ---
 
-## 📞 Support
-
-**AWS Account:** 241789448945  
-**IAM User:** jurispeed-backend-app  
-**Project:** Jurispeed BCN Scraper  
-**Contact:** Jurispeed Team
-
----
-
 **Last Updated:** August 5, 2026

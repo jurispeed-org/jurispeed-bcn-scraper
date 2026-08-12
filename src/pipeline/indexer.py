@@ -12,12 +12,12 @@ Coordinates the complete indexing pipeline:
 
 import structlog
 from typing import Dict, List
-from .models import ChileanLegalNorm
+from ..core.models import ChileanLegalNorm
 from .chunker import ProfessionalChunker
 from .embedder import BedrockEmbedder
-from .opensearch_client import OpenSearchIndexer
-from .s3_client import S3Storage
-from .config import Config
+from ..storage.opensearch_client import OpenSearchIndexer
+from ..storage.s3_client import S3Storage
+from ..utils.config import Config
 
 logger = structlog.get_logger()
 

@@ -33,8 +33,8 @@ load_dotenv()
 REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2")
 AMI_ID = "ami-0eb3161272dc9c6eb"  # Ubuntu 22.04 LTS us-west-2 (July 2026)
 INSTANCE_TYPE = "t3.small"
-KEY_NAME = None  # Will prompt or auto-detect
-SECURITY_GROUP = None  # Will use default VPC security group
+KEY_NAME = "jurispeed-debug-key"  # SSH key for debugging
+SECURITY_GROUP = "sg-012d740b6dbc49f78"  # Jurispeed scraper SG with SSH
 IAM_ROLE_NAME = "jurispeed-scraper-ec2-role"
 
 # Repository configuration
@@ -149,6 +149,59 @@ def get_or_create_iam_role():
         time.sleep(10)
 
         return IAM_ROLE_NAME
+
+
+def get_or_create_security_group():
+    """Create security group with SSH access if doesn't exist."""
+    ec2 = boto3.client("ec2", region_name=REGION)
+    sg_name = "jurispeed-scraper-sg"
+
+    try:
+        # Check if security group exists
+        response = ec2.describe_security_groups(
+            Filters=[
+                {"Name": "group-name", "Values": [sg_name]},
+            ]
+        )
+
+        if response["SecurityGroups"]:
+            sg_id = response["SecurityGroups"][0]["GroupId"]
+            print(f"✅ Security Group already exists: {sg_id}")
+            return sg_id
+
+    except ec2.exceptions.ClientError:
+        pass
+
+    # Create security group
+    print(f"📝 Creating Security Group: {sg_name}")
+
+    # Get default VPC
+    vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+    vpc_id = vpcs["Vpcs"][0]["VpcId"]
+
+    response = ec2.create_security_group(
+        GroupName=sg_name,
+        Description="Security group for Jurispeed BCN Scraper with SSH access",
+        VpcId=vpc_id,
+    )
+
+    sg_id = response["GroupId"]
+
+    # Add SSH rule (port 22 from anywhere)
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 22,
+                "ToPort": 22,
+                "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH access"}],
+            }
+        ],
+    )
+
+    print(f"✅ Security Group created: {sg_id}")
+    return sg_id
 
 
 def generate_user_data(instance_num: int, test_mode: bool = False):
@@ -282,6 +335,7 @@ def launch_instance(instance_num: int, test_mode: bool = False):
     print(f"\n🚀 Launching EC2 instance: {name}")
     print(f"   Type: {INSTANCE_TYPE}")
     print(f"   Region: {REGION}")
+    print(f"   SSH Key: {KEY_NAME}")
     if test_mode:
         print(f"   Range: {TEST_RANGE[0]:,} - {TEST_RANGE[1]:,} (TEST MODE)")
     else:
@@ -296,6 +350,7 @@ def launch_instance(instance_num: int, test_mode: bool = False):
         "MaxCount": 1,
         "UserData": user_data,
         "IamInstanceProfile": {"Name": IAM_ROLE_NAME},
+        "SecurityGroupIds": [SECURITY_GROUP],
         "TagSpecifications": [
             {
                 "ResourceType": "instance",
@@ -374,7 +429,9 @@ def main():
         print("❌ Error: Repository URL required")
         sys.exit(1)
 
-    KEY_NAME = args.key
+    # Use args.key if provided, otherwise keep default KEY_NAME
+    if args.key:
+        KEY_NAME = args.key
 
     print("\n" + "="*60)
     print("Jurispeed BCN Scraper - EC2 Launcher")

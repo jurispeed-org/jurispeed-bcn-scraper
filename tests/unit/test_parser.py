@@ -5,9 +5,15 @@ To run: pytest tests/test_parser.py
 """
 
 import pytest
+import sys
+from pathlib import Path
 from datetime import date
-from src.parser import BCNHtmlParser
-from src.models import NormType
+
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+
+from core.parser import BCNHtmlParser
+from core.models import NormType
 
 
 def test_parser_initialization():

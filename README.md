@@ -34,21 +34,42 @@ Production-ready scraper for Chilean legal norms from BCN (Biblioteca del Congre
 jurispeed-bcn-scraper/
 ├── src/
 │   ├── __init__.py
-│   ├── models.py              # Pydantic models (validation)
-│   ├── parser.py              # HTML parser
-│   ├── scraper.py             # Async scraper (httpx + tenacity)
-│   ├── chunker.py             # ⭐ Professional semantic chunker
-│   ├── embedder.py            # ⭐ Bedrock Cohere v4 client
-│   ├── opensearch_client.py   # ⭐ Direct OpenSearch indexing
-│   ├── s3_client.py           # ⭐ S3 document storage
-│   ├── indexer.py             # ⭐ Pipeline orchestrator
-│   ├── checkpoint.py          # DynamoDB checkpoint manager
-│   ├── config.py              # Configuration management
-│   └── cli.py                 # CLI interface
-├── tests/
-│   ├── test_parser.py
-│   ├── test_chunker.py
-│   └── test_scraper.py
+│   ├── cli.py                       # CLI interface
+│   ├── core/                        # Core scraping logic
+│   │   ├── __init__.py
+│   │   ├── models.py                # Pydantic models (validation)
+│   │   ├── parser.py                # HTML parser
+│   │   ├── scraper.py               # Async scraper (httpx + tenacity)
+│   │   └── scraper_playwright.py    # Playwright-based scraper
+│   ├── pipeline/                    # Processing pipeline
+│   │   ├── __init__.py
+│   │   ├── chunker.py               # ⭐ Professional semantic chunker
+│   │   ├── embedder.py              # ⭐ Bedrock Cohere v4 client
+│   │   ├── indexer.py               # ⭐ Pipeline orchestrator
+│   │   └── checkpoint.py            # DynamoDB checkpoint manager
+│   ├── storage/                     # AWS storage clients
+│   │   ├── __init__.py
+│   │   ├── s3_client.py             # ⭐ S3 document storage
+│   │   └── opensearch_client.py     # ⭐ Direct OpenSearch indexing
+│   └── utils/                       # Utilities
+│       ├── __init__.py
+│       └── config.py                # Configuration management
+├── scripts/                         # Deployment scripts
+│   ├── launch_ec2.py
+│   ├── setup_aws_resources.py
+│   ├── run_scraper.py
+│   ├── run_scraper_priority.py
+│   └── run_multi_instance.py
+├── deployment/                      # AWS configuration
+│   ├── ec2_user_data.sh
+│   └── priority_norms.txt
+├── tests/                          # Test suite
+│   ├── unit/
+│   │   └── test_parser.py
+│   └── integration/
+│       └── test_scraper_integration.py
+├── docs/                           # Documentation
+│   └── AWS_RESOURCES.md
 ├── pyproject.toml
 ├── .env.example
 └── README.md
@@ -136,41 +157,50 @@ python -m src.cli \
 ### Production Run
 
 ```bash
-python -m src.cli \
+# Using CLI directly
+python -m cli \
   --instance-id scraper-1 \
   --range-start 1 \
   --range-end 60000
+
+# Or using script
+python scripts/run_scraper.py \
+  --start 1 \
+  --end 60000 \
+  --instance-id scraper-1
 ```
 
 ### Resume from Checkpoint
 
 ```bash
-python -m src.cli \
-  --instance-id scraper-1 \
-  --range-start 1 \
-  --range-end 60000 \
-  --resume
+python scripts/run_scraper.py \
+  --resume \
+  --instance-id scraper-1
 ```
 
 ## Multi-Instance Deployment (EC2)
 
-Deploy 5 instances in parallel:
+Deploy 5 instances in parallel using the launch script:
+
+```bash
+# Launch EC2 instances (automated)
+python scripts/launch_ec2.py --instance-num 1
+python scripts/launch_ec2.py --instance-num 2
+python scripts/launch_ec2.py --instance-num 3
+python scripts/launch_ec2.py --instance-num 4
+python scripts/launch_ec2.py --instance-num 5
+```
+
+Or manually run on each instance:
 
 ```bash
 # Instance 1
-python -m src.cli --instance-id scraper-1 --range-start 1 --range-end 60000
+python scripts/run_scraper.py --start 1 --end 60000 --instance-id ec2-instance-1
 
 # Instance 2
-python -m src.cli --instance-id scraper-2 --range-start 60001 --range-end 120000
+python scripts/run_scraper.py --start 60001 --end 120000 --instance-id ec2-instance-2
 
-# Instance 3
-python -m src.cli --instance-id scraper-3 --range-start 120001 --range-end 180000
-
-# Instance 4
-python -m src.cli --instance-id scraper-4 --range-start 180001 --range-end 240000
-
-# Instance 5
-python -m src.cli --instance-id scraper-5 --range-start 240001 --range-end 300000
+# ... etc
 ```
 
 **Expected throughput:** ~900 docs/hour per instance = 4,500 docs/hour total
@@ -218,10 +248,13 @@ Edit `.env` file:
 
 ```bash
 # Run parser tests
-pytest tests/test_parser.py -v
+pytest tests/unit/test_parser.py -v
 
 # Run integration test (scrapes 3 real docs)
-pytest tests/test_scraper_integration.py -v
+pytest tests/integration/test_scraper_integration.py -v
+
+# Run all tests
+pytest tests/ -v
 ```
 
 ### Verify AWS Resources
