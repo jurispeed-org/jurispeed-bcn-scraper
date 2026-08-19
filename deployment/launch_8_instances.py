@@ -31,7 +31,7 @@ INSTANCE_TYPE = "t3.small"
 IAM_INSTANCE_PROFILE = "jurispeed-scraper-ec2-role"
 SECURITY_GROUP_ID = "sg-012d740b6dbc49f78"
 KEY_NAME = "jurispeed-debug-key"
-AMI_ID = "ami-05134c8ef96964280"  # Ubuntu 22.04 LTS us-west-2
+AMI_ID = "ami-0eb3161272dc9c6eb"  # Ubuntu 22.04 LTS us-west-2
 
 # Scraper configuration
 REPO_URL = "https://github.com/jurispeed-org/jurispeed-bcn-scraper.git"
@@ -41,7 +41,7 @@ PROJECT_DIR = "/opt/jurispeed-scraper"
 # Read .env file
 env_file = Path(__file__).parent.parent / ".env"
 if not env_file.exists():
-    print(f"❌ Error: .env file not found at {env_file}")
+    print(f"[ERROR] .env file not found at {env_file}")
     sys.exit(1)
 
 with open(env_file) as f:
@@ -197,17 +197,17 @@ def launch_instances(num_instances: int = 7):
 
         instance_id = response["Instances"][0]["InstanceId"]
         launched_instances.append((i, instance_id))
-        print(f"   ✅ Instance #{i}: {instance_id}")
+        print(f"   [SUCCESS] Instance #{i}: {instance_id}")
 
     print("\n" + "="*60)
-    print("✅ All instances launched!")
+    print("[SUCCESS] All instances launched!")
     print("="*60)
     print("\nInstance mapping:")
     print("  #1: i-091b91dee4898ebc0 (existing - needs re-tag)")
     for num, instance_id in launched_instances:
         print(f"  #{num}: {instance_id}")
 
-    print("\n⚠️  NEXT STEPS:")
+    print("\n[NEXT STEPS]")
     print("1. Re-tag existing instance to ScraperInstance=1:")
     print("   aws ec2 create-tags --resources i-091b91dee4898ebc0 --tags Key=ScraperInstance,Value=1 --region us-west-2")
     print("\n2. Update code on existing instance:")
@@ -235,17 +235,17 @@ def retag_existing_instance():
             {"Key": "Name", "Value": "jurispeed-scraper-1"},
         ]
     )
-    print("   ✅ Instance i-091b91dee4898ebc0 tagged as #1")
+    print("   [SUCCESS] Instance i-091b91dee4898ebc0 tagged as #1")
 
 
 def main():
     """Main entry point."""
     print("\n" + "="*60)
-    print("🚀 JURISPEED BCN SCRAPER - LAUNCH 8 INSTANCES")
+    print("JURISPEED BCN SCRAPER - LAUNCH 8 INSTANCES")
     print("="*60)
 
     # Confirm
-    print("\n⚠️  This will:")
+    print("\n[WARNING] This will:")
     print("  - Launch 7 NEW t3.small instances")
     print("  - Re-tag existing instance i-091b91dee4898ebc0 as #1")
     print("  - Cost: ~$50 for 25 days")
@@ -253,12 +253,12 @@ def main():
 
     response = input("Continue? (yes/no): ")
     if response.lower() != "yes":
-        print("❌ Aborted")
+        print("[ABORTED]")
         sys.exit(0)
 
     # Check repo URL
     if "YOUR_USERNAME" in REPO_URL:
-        print("\n❌ Error: Update REPO_URL in this script first!")
+        print("\n[ERROR] Update REPO_URL in this script first!")
         print(f"   Current: {REPO_URL}")
         sys.exit(1)
 
@@ -268,7 +268,7 @@ def main():
     # Launch new instances
     launched_instances = launch_instances(num_instances=7)
 
-    print("\n✅ Deployment complete!")
+    print("\n[SUCCESS] Deployment complete!")
 
 
 if __name__ == "__main__":
