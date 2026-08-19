@@ -202,6 +202,19 @@ class BCNPlaywrightScraper:
             self.stats.total_processed += 1
             return None
 
+        # Filter BCN placeholder pages (invalid IDs)
+        # These pages have generic title and minimal content (login form)
+        if (len(norm.full_content) < 500 and
+            "Biblioteca del Congreso Nacional" in norm.title):
+            logger.info(
+                "skipping_bcn_placeholder",
+                norm_id=norm_id,
+                content_length=len(norm.full_content),
+            )
+            self.stats.skipped_count += 1
+            self.stats.total_processed += 1
+            return None
+
         # Success
         self.stats.success_count += 1
         self.stats.total_processed += 1

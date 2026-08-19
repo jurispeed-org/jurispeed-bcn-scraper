@@ -18,9 +18,11 @@ import sys
 import os
 
 # Total range configuration
+# Based on priority_norms.txt, max ID is ~1.2M
+# We'll scan up to 2M to be safe (includes 404s that will be skipped)
 TOTAL_START = 1
-TOTAL_END = 300000
-NUM_INSTANCES = 5
+TOTAL_END = 2000000  # Updated: scan up to 2M IDs
+NUM_INSTANCES = 8    # Updated: use 8× t3.small as per estimation
 
 # Calculate range size
 RANGE_SIZE = (TOTAL_END - TOTAL_START + 1) // NUM_INSTANCES

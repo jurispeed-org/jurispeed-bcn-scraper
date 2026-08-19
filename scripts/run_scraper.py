@@ -52,6 +52,7 @@ class ProductionScraper:
     - Checkpoint every 1,000 docs
     - Resume from last checkpoint
     - Upload to S3 immediately
+    - Skip already scraped IDs from priority_norms.txt
     - Robust error handling
     - CloudWatch compatible logs
     """
@@ -61,9 +62,11 @@ class ProductionScraper:
         config: Config,
         instance_id: str,
         s3_bucket: str,
+        skip_ids: set[int] | None = None,
     ):
         self.config = config
         self.instance_id = instance_id
+        self.skip_ids = skip_ids or set()
 
         # Initialize components
         self.scraper = BCNPlaywrightScraper(config.scraper)
@@ -79,6 +82,7 @@ class ProductionScraper:
             "production_scraper_initialized",
             instance_id=instance_id,
             s3_bucket=s3_bucket,
+            skip_ids_count=len(self.skip_ids),
         )
 
     async def scrape_with_storage(
@@ -107,6 +111,11 @@ class ProductionScraper:
 
             # Scrape range
             for norm_id in range(start_id, end_id + 1):
+                # Skip if already scraped
+                if norm_id in self.skip_ids:
+                    logger.debug("skipping_already_scraped", norm_id=norm_id)
+                    continue
+
                 # Scrape one norm
                 norm = await self.scraper.scrape_one(norm_id)
 
@@ -225,6 +234,38 @@ class ProductionScraper:
         return None
 
 
+def load_skip_ids(file_path: str = "deployment/priority_norms.txt") -> set[int]:
+    """
+    Load IDs to skip from file (already scraped).
+
+    Args:
+        file_path: Path to file with one ID per line
+
+    Returns:
+        Set of IDs to skip
+    """
+    skip_ids = set()
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and line.isdigit():
+                    skip_ids.add(int(line))
+
+        logger.info(
+            "skip_ids_loaded",
+            file=file_path,
+            count=len(skip_ids),
+        )
+    except FileNotFoundError:
+        logger.warning("skip_file_not_found", file=file_path)
+    except Exception as e:
+        logger.error("skip_file_load_error", file=file_path, error=str(e))
+
+    return skip_ids
+
+
 async def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -258,8 +299,17 @@ async def main():
         type=str,
         help="S3 bucket name (default: from env S3_BUCKET_NAME)",
     )
+    parser.add_argument(
+        "--skip-file",
+        type=str,
+        default="deployment/priority_norms.txt",
+        help="File with IDs to skip (default: deployment/priority_norms.txt)",
+    )
 
     args = parser.parse_args()
+
+    # Load IDs to skip
+    skip_ids = load_skip_ids(args.skip_file)
 
     # Load config
     try:
@@ -281,6 +331,7 @@ async def main():
         config=config,
         instance_id=args.instance_id,
         s3_bucket=s3_bucket,
+        skip_ids=skip_ids,
     )
 
     # Determine start point
