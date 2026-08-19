@@ -1,7 +1,6 @@
 """Utility functions and configuration."""
 
-from .config import Config, ScraperConfig, AWSConfig
-
+# Lazy imports - only load when accessed
 __all__ = [
     "Config",
     "ScraperConfig",

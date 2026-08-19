@@ -8,9 +8,9 @@ import asyncio
 import structlog
 from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeout
 from typing import Optional
-from .models import ChileanLegalNorm, ScraperStats
-from .parser import BCNHtmlParser
-from ..utils.config import ScraperConfig
+from core.models import ChileanLegalNorm, ScraperStats
+from core.parser import BCNHtmlParser
+from utils.config import ScraperConfig
 
 logger = structlog.get_logger()
 

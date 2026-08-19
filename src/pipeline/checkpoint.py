@@ -9,8 +9,8 @@ import structlog
 from typing import Optional, Dict
 from datetime import datetime
 from botocore.exceptions import ClientError
-from ..core.models import ScraperStats
-from ..utils.config import AWSConfig
+from core.models import ScraperStats
+from utils.config import AWSConfig
 
 logger = structlog.get_logger()
 

@@ -9,7 +9,7 @@ import structlog
 from bs4 import BeautifulSoup
 from datetime import date, datetime
 from typing import Optional, List
-from .models import ChileanLegalNorm, NormType
+from core.models import ChileanLegalNorm, NormType
 
 logger = structlog.get_logger()
 

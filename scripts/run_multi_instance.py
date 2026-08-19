@@ -111,7 +111,7 @@ def get_instance_number_from_tags() -> int | None:
 
 def print_all_ranges():
     """Print all instance ranges (for planning)."""
-    print("\n📊 Scraping Ranges for 5 EC2 Instances\n")
+    print("\n[SCRAPING RANGES FOR 8 EC2 INSTANCES]\n")
     print("=" * 60)
 
     total_docs = TOTAL_END - TOTAL_START + 1
@@ -144,7 +144,7 @@ def run_scraper_for_instance(instance_num: int, resume: bool = True):
 
     s3_bucket = os.getenv("S3_BUCKET_NAME")
     if not s3_bucket:
-        print("❌ Error: S3_BUCKET_NAME environment variable not set", file=sys.stderr)
+        print("[ERROR] S3_BUCKET_NAME environment variable not set", file=sys.stderr)
         sys.exit(1)
 
     print(f"🚀 Launching scraper for Instance {instance_num}")
@@ -171,10 +171,10 @@ def run_scraper_for_instance(instance_num: int, resume: bool = True):
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"❌ Scraper failed with exit code {e.returncode}", file=sys.stderr)
+        print(f"[ERROR] Scraper failed with exit code {e.returncode}", file=sys.stderr)
         sys.exit(e.returncode)
     except KeyboardInterrupt:
-        print("\n⚠️  Scraper interrupted by user", file=sys.stderr)
+        print("\n[WARNING] Scraper interrupted by user", file=sys.stderr)
         sys.exit(130)
 
 
@@ -219,10 +219,10 @@ def main():
     if args.auto_detect:
         instance_num = get_instance_number_from_tags()
         if not instance_num:
-            print("❌ Error: Could not auto-detect instance number", file=sys.stderr)
-            print("   Make sure EC2 instance has 'ScraperInstance' tag set to 1-5", file=sys.stderr)
+            print("[ERROR] Could not auto-detect instance number", file=sys.stderr)
+            print("   Make sure EC2 instance has 'ScraperInstance' tag set to 1-8", file=sys.stderr)
             sys.exit(1)
-        print(f"✅ Auto-detected: Instance {instance_num}")
+        print(f"[SUCCESS] Auto-detected: Instance {instance_num}")
     else:
         instance_num = args.instance
 

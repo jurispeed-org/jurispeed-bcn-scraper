@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils.config import Config
 from core.scraper_playwright import BCNPlaywrightScraper
-from pipeline.checkpoint import CheckpointManager
-from storage.s3_client import S3Storage
+from pipeline.checkpoint import CheckpointManager  # Direct import, bypasses __init__
+from storage.s3_client import S3Storage  # Direct import, bypasses __init__
 from core.models import ChileanLegalNorm
 
 # Configure structured logging

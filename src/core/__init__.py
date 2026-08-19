@@ -1,9 +1,6 @@
 """Core scraping and parsing functionality."""
 
-from .models import ChileanLegalNorm, NormType, ScraperStats
-from .parser import BCNHtmlParser
-from .scraper_playwright import BCNPlaywrightScraper
-
+# Lazy imports - only load when accessed
 __all__ = [
     "ChileanLegalNorm",
     "NormType",
