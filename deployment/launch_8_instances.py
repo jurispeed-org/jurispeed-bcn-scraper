@@ -60,9 +60,9 @@ echo "📦 Updating system packages..."
 apt-get update -y
 apt-get upgrade -y
 
-# Install Python 3.12
-echo "🐍 Installing Python 3.12..."
-apt-get install -y python3.12 python3.12-venv python3-pip git
+# Install Python 3.10 (default in Ubuntu 22.04)
+echo "🐍 Installing Python 3.10..."
+apt-get install -y python3 python3-venv python3-pip git
 
 # Install Playwright dependencies
 echo "🎭 Installing Playwright system dependencies..."
@@ -83,7 +83,7 @@ git clone -b {BRANCH} {REPO_URL} .
 
 # Create virtual environment
 echo "🔧 Creating virtual environment..."
-python3.12 -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 
 # Install dependencies
