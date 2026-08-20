@@ -412,11 +412,47 @@ class BCNHtmlParser:
             return None
 
     def _extract_last_modified(self, soup: BeautifulSoup, norm_id: int) -> Optional[date]:
-        """Extract última modificación (optional)."""
+        """
+        Extract última modificación (optional).
+
+        Strategy:
+        1. Look in .datos div for "Última Modificación:"
+        2. Look for meta tag article:modified_time
+        3. Return None if not found
+        """
         try:
-            # TODO: Implement after HTML analysis
+            # Strategy 1: From .datos div
+            # Example: "Última Modificación:15-JUN-2024"
+            datos_elem = soup.find(class_="datos")
+            if datos_elem:
+                text = datos_elem.get_text()
+                # Pattern: "Última Modificación:" or "Modificación:"
+                match = re.search(r'[ÚU]ltima\s+Modificaci[oó]n:\s*(\d{1,2}-[A-Z]{3}-\d{4})', text, re.IGNORECASE)
+                if match:
+                    date_str = match.group(1)
+                    date_parsed = self._parse_chilean_date(date_str)
+                    if date_parsed:
+                        return date_parsed
+
+                # Alternative pattern without "Última"
+                match = re.search(r'Modificaci[oó]n:\s*(\d{1,2}-[A-Z]{3}-\d{4})', text, re.IGNORECASE)
+                if match:
+                    date_str = match.group(1)
+                    date_parsed = self._parse_chilean_date(date_str)
+                    if date_parsed:
+                        return date_parsed
+
+            # Strategy 2: Meta tag article:modified_time
+            meta = soup.find("meta", {"name": "article:modified_time"})
+            if meta and meta.get("content"):
+                date_parsed = self._parse_chilean_date(meta["content"])
+                if date_parsed:
+                    return date_parsed
+
             return None
-        except Exception:
+
+        except Exception as e:
+            logger.debug("last_modified_extraction_failed", norm_id=norm_id, error=str(e))
             return None
 
     def _extract_issuing_body(self, soup: BeautifulSoup, norm_id: int) -> str:
@@ -602,9 +638,10 @@ class BCNHtmlParser:
 
         Strategy:
         1. Find BCN-specific content container (.texto_norma or .cuerpo-norma)
-        2. Extract text, preserve structure (paragraphs)
-        3. Clean HTML artifacts
-        4. Validate minimum length
+        2. Format marginal notes inline (metadata valuable for modifications)
+        3. Extract text, preserve structure (paragraphs)
+        4. Clean HTML artifacts
+        5. Validate minimum length
         """
         try:
             # Strategy 1: BCN-specific selectors (Playwright-rendered pages)
@@ -612,6 +649,16 @@ class BCNHtmlParser:
             content_elem = soup.find(class_="texto_norma")
 
             if content_elem:
+                # 🔧 FIX: Format marginal notes inline instead of removing them
+                # BCN uses <span class="n rs_skip_always"> for legislative modification notes
+                for note in content_elem.find_all('span', class_='n'):
+                    note_text = note.get_text(separator=" ", strip=True)
+                    if note_text:
+                        # Replace note with inline formatted version
+                        # Get text and clean up extra spaces from <br> tags
+                        note_text = ' '.join(note_text.split())
+                        note.string = f" [{note_text}] "
+
                 text = content_elem.get_text(separator="\n\n", strip=True)
                 if len(text) >= 100:
                     return self._clean_text(text)
@@ -620,6 +667,13 @@ class BCNHtmlParser:
             content_elem = soup.find(class_="cuerpo-norma")
 
             if content_elem:
+                # Format marginal notes inline
+                for note in content_elem.find_all('span', class_='n'):
+                    note_text = note.get_text(separator=" ", strip=True)
+                    if note_text:
+                        note_text = ' '.join(note_text.split())
+                        note.string = f" [{note_text}] "
+
                 text = content_elem.get_text(separator="\n\n", strip=True)
                 if len(text) >= 100:
                     return self._clean_text(text)
@@ -630,6 +684,13 @@ class BCNHtmlParser:
             )
 
             if content_elem:
+                # Format marginal notes inline
+                for note in content_elem.find_all('span', class_='n'):
+                    note_text = note.get_text(separator=" ", strip=True)
+                    if note_text:
+                        note_text = ' '.join(note_text.split())
+                        note.string = f" [{note_text}] "
+
                 text = content_elem.get_text(separator="\n\n", strip=True)
                 if len(text) >= 100:
                     return self._clean_text(text)

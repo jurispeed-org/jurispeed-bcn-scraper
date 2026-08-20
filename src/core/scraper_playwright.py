@@ -117,6 +117,38 @@ class BCNPlaywrightScraper:
                 # Additional wait for dynamic content
                 await asyncio.sleep(2)  # Give Angular time to render
 
+                # 🔧 FIX: Auto-scroll to load lazy-loaded content
+                await page.evaluate("""
+                    async () => {
+                        const distance = 100;
+                        const delay = 100;
+                        const maxAttempts = 3;
+
+                        let previousHeight = 0;
+                        let stableAttempts = 0;
+
+                        while (stableAttempts < maxAttempts) {
+                            // Scroll to bottom
+                            window.scrollTo(0, document.body.scrollHeight);
+
+                            // Wait for content to load
+                            await new Promise(resolve => setTimeout(resolve, delay));
+
+                            // Check if height changed
+                            const currentHeight = document.body.scrollHeight;
+                            if (currentHeight === previousHeight) {
+                                stableAttempts++;
+                            } else {
+                                stableAttempts = 0; // Reset if new content loaded
+                                previousHeight = currentHeight;
+                            }
+                        }
+                    }
+                """)
+
+                # Wait a bit more after scrolling for content to load
+                await asyncio.sleep(1)
+
             except PlaywrightTimeout:
                 logger.warning("content_timeout", norm_id=norm_id)
                 # Continue anyway, we might have partial content

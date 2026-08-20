@@ -52,7 +52,6 @@ class ProductionScraper:
     - Checkpoint every 1,000 docs
     - Resume from last checkpoint
     - Upload to S3 immediately
-    - Skip already scraped IDs from priority_norms.txt
     - Robust error handling
     - CloudWatch compatible logs
     """
@@ -111,10 +110,10 @@ class ProductionScraper:
 
             # Scrape range
             for norm_id in range(start_id, end_id + 1):
-                # Skip if already scraped
-                if norm_id in self.skip_ids:
-                    logger.debug("skipping_already_scraped", norm_id=norm_id)
-                    continue
+                # Skip if already scraped (DISABLED - starting fresh)
+                # if norm_id in self.skip_ids:
+                #     logger.debug("skipping_already_scraped", norm_id=norm_id)
+                #     continue
 
                 # Scrape one norm
                 norm = await self.scraper.scrape_one(norm_id)
@@ -309,7 +308,9 @@ async def main():
     args = parser.parse_args()
 
     # Load IDs to skip
-    skip_ids = load_skip_ids(args.skip_file)
+    # DISABLED: Starting fresh, no skip list
+    # skip_ids = load_skip_ids(args.skip_file)
+    skip_ids = set()
 
     # Load config
     try:

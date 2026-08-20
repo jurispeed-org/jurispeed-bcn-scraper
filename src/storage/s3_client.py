@@ -141,3 +141,55 @@ class S3Storage:
     def get_stats(self) -> Dict:
         """Get storage statistics."""
         return self.stats.copy()
+
+    def list_objects(self, prefix: str) -> list[str]:
+        """
+        List all object keys under a prefix.
+
+        Args:
+            prefix: S3 prefix to list
+
+        Returns:
+            List of S3 keys
+        """
+        try:
+            keys = []
+            paginator = self.client.get_paginator("list_objects_v2")
+            pages = paginator.paginate(Bucket=self.bucket_name, Prefix=prefix)
+
+            for page in pages:
+                if "Contents" in page:
+                    for obj in page["Contents"]:
+                        keys.append(obj["Key"])
+
+            return keys
+
+        except ClientError as e:
+            logger.error(
+                "s3_list_failed",
+                prefix=prefix,
+                error=e.response["Error"]["Message"],
+            )
+            return []
+
+    def get_object(self, key: str) -> str:
+        """
+        Get object content from S3.
+
+        Args:
+            key: S3 key
+
+        Returns:
+            Object content as string
+        """
+        try:
+            response = self.client.get_object(Bucket=self.bucket_name, Key=key)
+            return response["Body"].read().decode("utf-8")
+
+        except ClientError as e:
+            logger.error(
+                "s3_get_failed",
+                key=key,
+                error=e.response["Error"]["Message"],
+            )
+            raise
