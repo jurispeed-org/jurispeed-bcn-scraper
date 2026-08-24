@@ -20,7 +20,7 @@ sys.path.insert(0, str(project_root / "src"))
 os.chdir(project_root)
 
 from src.utils.config import Config
-from src.core.scraper_playwright import BCNPlaywrightScraper
+from src.core.scraper import BCNPlaywrightScraper
 
 
 async def test_speed():

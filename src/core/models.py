@@ -98,6 +98,91 @@ class ChileanLegalNorm(BaseModel):
         """Clean and normalize title."""
         return " ".join(v.strip().split())
 
+    @property
+    def formal_citation(self) -> str:
+        """
+        Generate formal citation for this norm.
+
+        Examples:
+            - "LEY N° 824"
+            - "DFL N° 830"
+            - "CÓDIGO CIVIL"
+
+        Returns:
+            Formal citation string suitable for legal references
+        """
+        # Normalize norm_type
+        type_map = {
+            "ley": "LEY",
+            "codigo": "CÓDIGO",
+            "dfl": "DFL",
+            "decreto": "DECRETO",
+            "reglamento": "REGLAMENTO"
+        }
+
+        norm_type_value = self.norm_type.value if hasattr(self.norm_type, 'value') else str(self.norm_type)
+        formal_type = type_map.get(norm_type_value.lower(), norm_type_value.upper())
+
+        return f"{formal_type} N° {self.norm_number}"
+
+    def get_article_citation(
+        self,
+        article_number: int,
+        is_nested: bool = False,
+        parent_article: Optional[int] = None
+    ) -> str:
+        """
+        Generate formal citation for a specific article.
+
+        Args:
+            article_number: Article number (e.g., 2)
+            is_nested: True if article is nested within another (e.g., "DEL ART 1")
+            parent_article: Parent article number if nested
+
+        Returns:
+            Full citation including article and hierarchy context
+
+        Examples:
+            >>> norm.get_article_citation(2)
+            "LEY N° 824, Artículo 2"
+
+            >>> norm.get_article_citation(2, is_nested=True, parent_article=1)
+            "LEY N° 824, Artículo 2 (del texto aprobado en Artículo 1)"
+        """
+        base_citation = f"{self.formal_citation}, Artículo {article_number}"
+
+        if is_nested and parent_article:
+            # This article is part of the law TEXT approved in a parent decree article
+            base_citation += f" (del texto aprobado en Artículo {parent_article})"
+
+        return base_citation
+
+    def get_article_url(self, part_id: Optional[str] = None) -> str:
+        """
+        Generate URL to specific article using idParte.
+
+        Args:
+            part_id: BCN's part ID (e.g., "p8656021")
+
+        Returns:
+            Full URL to article
+
+        Examples:
+            >>> norm.get_article_url("p8656021")
+            "https://www.bcn.cl/leychile/navegar?idNorma=6368&idParte=8656021"
+
+            >>> norm.get_article_url()
+            "https://www.bcn.cl/leychile/navegar?idNorma=6368"
+        """
+        base_url = str(self.official_url)
+
+        if part_id:
+            # Add idParte parameter for direct article linking
+            separator = "&" if "?" in base_url else "?"
+            return f"{base_url}{separator}idParte={part_id}"
+
+        return base_url
+
     def to_lexintel_format(self) -> dict:
         """
         Convert to Lexintel API format.

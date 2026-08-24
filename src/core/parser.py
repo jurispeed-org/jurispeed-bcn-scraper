@@ -81,6 +81,127 @@ class BCNHtmlParser:
             )
             return None
 
+    def extract_article_hierarchy(self, html: str, norm_id: int) -> dict:
+        """
+        Extract article hierarchy from BCN TOC (Table of Contents).
+
+        BCN laws often have nested structure:
+        - ARTICULO 1 of decree: "Approves the following text..."
+          - Artículo 1 (DEL ART 1): Real law article
+          - Artículo 2 (DEL ART 1): Real law article
+        - ARTICULO 2 of decree: Additional provisions
+
+        Returns:
+            Dict mapping part_id → hierarchy metadata:
+            {
+                "p8656021": {
+                    "article_number": 1,
+                    "article_label": "Artículo 1 (DEL ART 1)",
+                    "parent_article": 1,  # Parent in hierarchy
+                    "hierarchy_level": 2,  # 1=root, 2=nested
+                    "is_nested": True
+                }
+            }
+        """
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            hierarchy = {}
+
+            # Find TOC navigation (usually in a <nav> or specific div)
+            # BCN uses links like: <a href="#p8656021" title="Artículo 1 (DEL ART 1)">
+            toc_links = soup.find_all('a', href=re.compile(r'^#p\d+'))
+
+            for link in toc_links:
+                # Extract part_id from href
+                href = link.get('href', '')
+                part_id = href.lstrip('#')
+
+                if not part_id.startswith('p'):
+                    continue
+
+                # Extract title/label
+                title = link.get('title', '') or link.get_text(strip=True)
+
+                # Parse article info from title
+                # Examples:
+                # - "Artículo 1 (DEL ART 1)" → nested under ARTICULO 1
+                # - "ARTICULO 2" → root level
+                # - "Artículo 14 BIS (DEL ART 1)" → nested
+
+                article_info = self._parse_article_title(title, link)
+
+                if article_info:
+                    hierarchy[part_id] = article_info
+
+            logger.debug(
+                "hierarchy_extracted",
+                norm_id=norm_id,
+                total_parts=len(hierarchy),
+                nested_parts=sum(1 for v in hierarchy.values() if v.get('is_nested', False))
+            )
+
+            return hierarchy
+
+        except Exception as e:
+            logger.warning(
+                "hierarchy_extraction_failed",
+                norm_id=norm_id,
+                error=str(e)
+            )
+            return {}
+
+    def _parse_article_title(self, title: str, link_element) -> Optional[dict]:
+        """
+        Parse article title from TOC to extract hierarchy info (case-insensitive).
+
+        Examples:
+        - "Artículo 1 (DEL ART 1)" → {article_number: 1, parent_article: 1, is_nested: True}
+        - "ARTICULO 2" → {article_number: 2, parent_article: None, is_nested: False}
+        - "artículo 3" → {article_number: 3, parent_article: None, is_nested: False}
+        - "PARRAFO 2 Definiciones" → None (not an article)
+        """
+        if not title or not isinstance(title, str):
+            return None
+
+        # Extract article number (case-insensitive)
+        # Pattern: "Artículo 14 BIS (DEL ART 1)" or "ARTICULO 2" or "artículo 3"
+        article_match = re.search(r'art[ií]culo\s+(\d+)', title, re.IGNORECASE)
+
+        if not article_match:
+            return None
+
+        article_number = int(article_match.group(1))
+
+        # Check if nested (has "DEL ART X")
+        parent_match = re.search(r'\(DEL ART (\d+)\)', title, re.IGNORECASE)
+
+        info = {
+            "article_number": article_number,
+            "article_label": title,
+            "is_nested": parent_match is not None,
+            "parent_article": int(parent_match.group(1)) if parent_match else None,
+            "hierarchy_level": 2 if parent_match else 1
+        }
+
+        # Determine nesting level from DOM structure
+        # BCN uses nested <ul> for hierarchy
+        parent_li = link_element.find_parent('li')
+        if parent_li:
+            # Count parent <ul> elements
+            level = 1
+            current = parent_li
+            while current:
+                parent_ul = current.find_parent('ul')
+                if parent_ul:
+                    level += 1
+                    current = parent_ul.find_parent('li')
+                else:
+                    break
+
+            info["hierarchy_level"] = level
+
+        return info
+
     def _extract_norm_type(self, soup: BeautifulSoup, norm_id: int) -> str:
         """
         Extract tipo_norma (norm type) from HTML.
@@ -121,20 +242,37 @@ class BCNHtmlParser:
 
         Examples:
         - "LEY NUM. 19.846" → "19846"
-        - "CODIGO CIVIL" → "DFL-1"
+        - "Decreto Ley 824" → "824"
+        - "Ley 21210" → "21210"
         - "DFL 830" → "830"
+        - "CODIGO CIVIL" → use norm_id as fallback
         """
         try:
             title = self._get_title_text(soup)
 
-            # Pattern: "NUM. 12.345" or "Nº 12.345"
-            match = re.search(r"N[UÚ]M\.?\s*(\d[\d.,\s-]*)", title, re.IGNORECASE)
+            # Pattern: "NUM. 12.345" or "Nº 12.345" or "N° 12.345"
+            match = re.search(r"N[UÚ°]M?\.?\s*(\d[\d.,\s-]*)", title, re.IGNORECASE)
             if match:
                 number = match.group(1).replace(".", "").replace(",", "").replace(" ", "")
                 return number
 
-            # Pattern: "DFL 123" or "DECRETO 456"
-            match = re.search(r"(?:DFL|DECRETO)\s+(\d+)", title, re.IGNORECASE)
+            # Pattern: "Decreto Ley 824" or "Decreto-Ley 824"
+            match = re.search(r"Decreto[\s-]?Ley\s+(\d+)", title, re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+            # Pattern: "Ley 21210" (without NUM/Nº)
+            match = re.search(r"\bLey\s+(\d+)", title, re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+            # Pattern: "DFL 123" or "DFL-123"
+            match = re.search(r"DFL[\s-]?(\d+)", title, re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+            # Pattern: "DECRETO 456"
+            match = re.search(r"\bDECRETO\s+(\d+)", title, re.IGNORECASE)
             if match:
                 return match.group(1)
 

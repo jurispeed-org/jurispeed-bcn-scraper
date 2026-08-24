@@ -23,8 +23,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils.config import Config
-from core.scraper_playwright import BCNPlaywrightScraper
+from core.scraper import BCNPlaywrightScraper
+from core.xml_parser import BCNXMLParser
 from pipeline.checkpoint import CheckpointManager  # Direct import, bypasses __init__
+from pipeline.norm_tracker import NormTracker  # Direct import, bypasses __init__
+from pipeline.chunker import ProfessionalChunker
 from storage.s3_client import S3Storage  # Direct import, bypasses __init__
 from core.models import ChileanLegalNorm
 
@@ -69,7 +72,14 @@ class ProductionScraper:
 
         # Initialize components
         self.scraper = BCNPlaywrightScraper(config.scraper)
+        self.xml_parser = BCNXMLParser()
+        self.chunker = ProfessionalChunker(
+            target_chunk_size=512,
+            article_max_size=8192,
+            overlap_tokens=200
+        )
         self.checkpoint_mgr = CheckpointManager(config.aws, instance_id)
+        self.norm_tracker = NormTracker(config.aws)
         self.s3_storage = S3Storage(
             bucket_name=s3_bucket,
             region=config.aws.region,
@@ -82,6 +92,7 @@ class ProductionScraper:
             instance_id=instance_id,
             s3_bucket=s3_bucket,
             skip_ids_count=len(self.skip_ids),
+            chunking="enabled"
         )
 
     async def scrape_with_storage(
@@ -118,9 +129,15 @@ class ProductionScraper:
                 # Scrape one norm
                 norm = await self.scraper.scrape_one(norm_id)
 
-                # Upload to S3 if successful
+                # Upload to S3 if successful, or track failure
                 if norm:
-                    await self._store_norm(norm)
+                    # Fetch XML again for chunking (necessary for subestructura)
+                    xml_content = await self.scraper._fetch_xml(norm_id, timeout=30)
+                    await self._store_norm(norm, xml_content)
+                else:
+                    # Track failed norm for retry logic
+                    error_reason = self.scraper.last_error or "Unknown error"
+                    self.norm_tracker.mark_failed(norm_id, error_reason)
 
                 # Checkpoint every N docs
                 if (norm_id - start_id + 1) % self.config.scraper.checkpoint_every == 0:
@@ -170,13 +187,112 @@ class ProductionScraper:
             # Cleanup
             await self.scraper.close()
 
-    async def _store_norm(self, norm: ChileanLegalNorm) -> None:
+    async def process_norm_data(self, norm: ChileanLegalNorm, xml_content: str = None) -> dict:
         """
-        Store norm to S3.
+        Process norm with chunking and return complete data dict.
 
         Args:
             norm: Validated legal norm
+            xml_content: Raw XML for chunking (optional but recommended)
+
+        Returns:
+            Complete data dict with chunks ready for storage
         """
+        # Extract hierarchy and chunk
+        chunks = []
+        total_articles = 0
+        vigentes = 0
+
+        if xml_content:
+            try:
+                # Extract article metadata from XML
+                hierarchy = self.xml_parser.extract_article_hierarchy(xml_content, norm.norm_id)
+                article_texts = self.xml_parser.extract_article_texts(xml_content)
+
+                total_articles = len(hierarchy)
+                vigentes = sum(1 for info in hierarchy.values() if info.get('vigente'))
+
+                # Chunk with XML data
+                metadata = {
+                    "norm_id": norm.norm_id,
+                    "norm_type": norm.norm_type.value if hasattr(norm.norm_type, 'value') else norm.norm_type,
+                    "norm_number": norm.norm_number,
+                    "norm_title": norm.title,
+                    "official_url": str(norm.official_url)
+                }
+
+                chunks = self.chunker.chunk(
+                    norm.full_content,
+                    metadata=metadata,
+                    xml_content=xml_content,
+                    norm_id=norm.norm_id
+                )
+
+                logger.info(
+                    "chunking_complete",
+                    norm_id=norm.norm_id,
+                    total_chunks=len(chunks),
+                    total_articles=total_articles,
+                    vigentes=vigentes
+                )
+
+            except Exception as e:
+                logger.warning(
+                    "chunking_failed",
+                    norm_id=norm.norm_id,
+                    error=str(e),
+                    note="Falling back to raw norm only"
+                )
+
+        # Prepare document with all required fields
+        data = {
+            "norm_id": norm.norm_id,
+            "norm_type": norm.norm_type.value if hasattr(norm.norm_type, 'value') else norm.norm_type,
+            "norm_number": norm.norm_number,
+            "formal_citation": norm.formal_citation,
+            "title": norm.title,
+            "publication_date": norm.publication_date.isoformat() if norm.publication_date else None,
+            "official_url": str(norm.official_url),
+            "summary": norm.summary,
+            "issuing_body": norm.issuing_body,
+            "subject_tags": norm.subject_tags,
+            "source": "xml",
+            "full_content": norm.full_content,
+        }
+
+        # Add chunking data if available
+        if chunks:
+            data["chunks"] = [
+                {
+                    "chunk_index": c.chunk_index,
+                    "article_number": c.metadata.get("article_number"),
+                    "vigente": c.metadata.get("vigente"),
+                    "token_count": c.token_count,
+                    "content": c.text,
+                    "metadata": c.metadata
+                }
+                for c in chunks
+            ]
+            data["total_chunks"] = len(chunks)
+            data["total_articles"] = total_articles
+            data["vigentes"] = vigentes
+        else:
+            data["chunks"] = []
+            data["total_chunks"] = 0
+
+        return data
+
+    async def _store_norm(self, norm: ChileanLegalNorm, xml_content: str = None) -> None:
+        """
+        Process and upload norm to S3.
+
+        Args:
+            norm: Validated legal norm
+            xml_content: Raw XML for chunking
+        """
+        # Process norm data (same logic as tests use)
+        data = await self.process_norm_data(norm, xml_content)
+
         # Build S3 key
         doc_id = f"bcn-{norm.norm_id}"
         key = self.s3_storage.build_key(
@@ -185,13 +301,11 @@ class ProductionScraper:
             prefix="originals",
         )
 
-        # Convert to dict with JSON serialization
-        data = norm.model_dump(mode='json')
-
-        # Add metadata
+        # Add S3 metadata
         metadata = {
             "instance_id": self.instance_id,
-            "source": "bcn-scraper",
+            "source": "bcn-scraper-xml",
+            "has_chunks": str(data.get("total_chunks", 0) > 0).lower()
         }
 
         # Upload

@@ -10,6 +10,7 @@ import json
 from typing import List
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from botocore.exceptions import ClientError
+from pipeline.smart_batcher import SmartBatcher
 
 logger = structlog.get_logger()
 
@@ -172,28 +173,41 @@ class BedrockEmbedder:
         self, texts: List[str], batch_size: int = 96
     ) -> List[List[float]]:
         """
-        Embed large list of texts with automatic batching.
+        Embed large list of texts with automatic smart batching.
+
+        Uses SmartBatcher to optimize batches considering both:
+        - Text count limit (96 texts)
+        - Token count limit (100K tokens per batch)
 
         Args:
             texts: List of texts (can be > 96)
-            batch_size: Size of each batch (max 96)
+            batch_size: Ignored (SmartBatcher handles limits automatically)
 
         Returns:
             List of all embedding vectors
         """
-        if batch_size > 96:
-            batch_size = 96
+        # Use SmartBatcher for intelligent batching
+        batcher = SmartBatcher()
+        batches = batcher.create_batches(texts)
+
+        logger.info(
+            "smart_batching_applied",
+            total_texts=len(texts),
+            batches_created=len(batches),
+            avg_batch_size=f"{batcher.stats['avg_batch_size']:.1f}",
+        )
 
         all_embeddings = []
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
+        for batch_idx, batch in enumerate(batches, 1):
             embeddings = self.embed_texts(batch)
             all_embeddings.extend(embeddings)
 
             logger.debug(
                 "batch_progress",
-                processed=min(i + batch_size, len(texts)),
+                batch=f"{batch_idx}/{len(batches)}",
+                batch_size=len(batch),
+                processed=len(all_embeddings),
                 total=len(texts),
             )
 

@@ -19,6 +19,10 @@ class AWSConfig(BaseModel):
         default="jurispeed-scraper-checkpoints",
         description="DynamoDB table for checkpoints"
     )
+    norm_status_table: str = Field(
+        default="jurispeed-norm-status",
+        description="DynamoDB table for individual norm status tracking"
+    )
 
 
 class LexintelConfig(BaseModel):
@@ -48,16 +52,34 @@ class ScraperConfig(BaseModel):
         description="Delay between requests"
     )
     max_retries: int = Field(
-        default=3,
+        default=7,
         ge=1,
-        le=10,
-        description="Max retry attempts"
+        le=15,
+        description="Max retry attempts for XML (no HTML fallback)"
     )
     timeout_seconds: int = Field(
         default=30,
         ge=10,
         le=120,
-        description="HTTP request timeout"
+        description="Initial HTTP request timeout (increases per retry)"
+    )
+    max_timeout_seconds: int = Field(
+        default=60,
+        ge=30,
+        le=180,
+        description="Maximum timeout for retries"
+    )
+    retry_backoff_base: float = Field(
+        default=2.0,
+        ge=1.0,
+        le=5.0,
+        description="Base for exponential backoff (seconds)"
+    )
+    retry_backoff_max: float = Field(
+        default=64.0,
+        ge=10.0,
+        le=120.0,
+        description="Maximum backoff time (seconds)"
     )
     checkpoint_every: int = Field(
         default=1000,

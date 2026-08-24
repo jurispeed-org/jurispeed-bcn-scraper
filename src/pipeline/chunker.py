@@ -45,14 +45,16 @@ class ProfessionalChunker:
     def __init__(
         self,
         target_chunk_size: int = 512,  # tokens (optimal for Cohere v4)
-        max_chunk_size: int = 1000,  # tokens (hard limit)
-        overlap_tokens: int = 50,  # overlap for context
+        max_chunk_size: int = 2048,  # tokens (hard limit for non-article chunks)
+        overlap_tokens: int = 200,  # overlap for context (increased for legal text)
         min_chunk_size: int = 100,  # avoid tiny chunks
+        article_max_size: int = 8192,  # max size for a single article before splitting (4× increased)
     ):
         self.target_chunk_size = target_chunk_size
         self.max_chunk_size = max_chunk_size
         self.overlap_tokens = overlap_tokens
         self.min_chunk_size = min_chunk_size
+        self.article_max_size = article_max_size
 
         # Hierarchical separators (legal text specific)
         self.separators = [
@@ -82,13 +84,16 @@ class ProfessionalChunker:
         """
         return int(len(text) * 0.6)
 
-    def chunk(self, text: str, metadata: Optional[Dict] = None) -> List[Chunk]:
+    def chunk(self, text: str, metadata: Optional[Dict] = None, html: Optional[str] = None, norm_id: Optional[int] = None, xml_content: Optional[str] = None) -> List[Chunk]:
         """
         Chunk text using semantic boundaries.
 
         Args:
             text: Full text to chunk
             metadata: Optional metadata to attach to all chunks
+            html: Optional raw HTML for hierarchy extraction (legacy)
+            norm_id: Optional norm ID for hierarchy extraction
+            xml_content: Optional XML content (preferred over HTML)
 
         Returns:
             List of Chunk objects
@@ -99,30 +104,92 @@ class ProfessionalChunker:
         # Normalize whitespace
         text = self._normalize_text(text)
 
+        # Extract hierarchy from XML (preferred) or HTML
+        hierarchy = {}
+        article_texts = {}
+
+        if xml_content and norm_id:
+            # Use XML parser (preferred)
+            try:
+                from core.xml_parser import BCNXMLParser
+                parser = BCNXMLParser()
+                hierarchy = parser.extract_article_hierarchy(xml_content, norm_id)
+                article_texts = parser.extract_article_texts(xml_content)
+                logger.debug("xml_hierarchy_loaded", total_parts=len(hierarchy))
+            except Exception as e:
+                logger.warning("xml_hierarchy_extraction_failed", error=str(e))
+        elif html and norm_id:
+            # Fallback to HTML parser (legacy)
+            try:
+                from core.parser import BCNHtmlParser
+                parser = BCNHtmlParser()
+                hierarchy = parser.extract_article_hierarchy(html, norm_id)
+                part_id_map = self._build_part_id_map(html, hierarchy)
+                logger.debug("html_hierarchy_loaded", total_parts=len(hierarchy))
+            except Exception as e:
+                logger.warning("html_hierarchy_extraction_failed", error=str(e))
+
         # Detect if legal text with articles
         has_articles = self._detect_articles(text)
 
-        if has_articles:
+        # Use idParte-based chunking if hierarchy available
+        if has_articles and hierarchy:
+            if article_texts:
+                # XML path
+                logger.info("chunking_by_xml_idparte", total_parts=len(hierarchy))
+                chunks = self._chunk_by_xml(article_texts, hierarchy, metadata)
+            elif html:
+                # HTML path (legacy)
+                logger.info("chunking_by_html_idparte", total_parts=len(hierarchy))
+                chunks = self._chunk_by_idparte(html, hierarchy, metadata)
+            else:
+                logger.info("chunking_legal_text_with_articles")
+                chunks = self._chunk_by_articles(text)
+        elif has_articles:
             logger.info("chunking_legal_text_with_articles")
             chunks = self._chunk_by_articles(text)
         else:
             logger.info("chunking_generic_text")
             chunks = self._chunk_by_semantic_boundaries(text)
 
-        # Add overlap for context preservation
-        chunks = self._add_overlap(chunks, text)
+        # Add overlap for context preservation (skip for article-based chunks)
+        if not has_articles:
+            chunks = self._add_overlap(chunks, text)
 
         # Convert to Chunk objects with metadata
         chunk_objects = []
-        for i, chunk_text in enumerate(chunks):
+        for i, chunk_data in enumerate(chunks):
+            # Handle both dict (from idParte) and string (from regex) chunks
+            if isinstance(chunk_data, dict):
+                # idParte-based chunk (already has metadata)
+                chunk_text = chunk_data["text"]
+                chunk_metadata = chunk_data["metadata"]
+            else:
+                # Regex-based chunk (need to extract metadata)
+                chunk_text = chunk_data
+                chunk_metadata = metadata.copy() if metadata else {}
+
+                # If has articles, extract article number and add to metadata
+                if has_articles:
+                    article_num = self._extract_article_number(chunk_text)
+                    if article_num is not None:
+                        chunk_metadata["article_number"] = article_num
+
+                        # Add hierarchy metadata if available
+                        if hierarchy and part_id_map:
+                            # Find part_id for this chunk based on article number and text
+                            part_info = self._find_chunk_hierarchy(chunk_text, article_num, hierarchy, part_id_map)
+                            if part_info:
+                                chunk_metadata.update(part_info)
+
             chunk_obj = Chunk(
                 text=chunk_text,
                 chunk_index=i,
                 chunk_total=len(chunks),
                 token_count=self.estimate_tokens(chunk_text),
-                char_start=text.find(chunk_text),
-                char_end=text.find(chunk_text) + len(chunk_text),
-                metadata=metadata or {},
+                char_start=text.find(chunk_text) if isinstance(chunk_data, str) else 0,
+                char_end=(text.find(chunk_text) + len(chunk_text)) if isinstance(chunk_data, str) else len(chunk_text),
+                metadata=chunk_metadata,
             )
             chunk_objects.append(chunk_obj)
 
@@ -134,6 +201,93 @@ class ProfessionalChunker:
         )
 
         return chunk_objects
+
+    def _build_part_id_map(self, html: str, hierarchy: dict) -> dict:
+        """
+        Build map of part_id → text snippet for matching chunks.
+
+        Returns dict: {part_id: text_preview}
+        """
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "lxml")
+            part_map = {}
+
+            for part_id in hierarchy.keys():
+                # Find the div with this ID
+                part_div = soup.find(id=part_id)
+                if part_div:
+                    # Get first 200 chars of text for matching
+                    text = part_div.get_text(strip=True)[:200]
+                    part_map[part_id] = text
+
+            return part_map
+
+        except Exception as e:
+            logger.warning("part_id_map_build_failed", error=str(e))
+            return {}
+
+    def _find_chunk_hierarchy(self, chunk_text: str, article_num: int, hierarchy: dict, part_id_map: dict) -> Optional[dict]:
+        """
+        Find hierarchy metadata for a chunk.
+
+        Matches chunk to part_id by:
+        1. Article number match
+        2. Text similarity
+
+        Returns hierarchy metadata or None
+        """
+        try:
+            # Get first 200 chars of chunk for matching
+            chunk_preview = chunk_text.strip()[:200]
+
+            # Find matching part_id
+            best_match = None
+            best_score = 0
+
+            for part_id, part_preview in part_id_map.items():
+                # Get hierarchy info for this part
+                part_info = hierarchy.get(part_id)
+                if not part_info:
+                    continue
+
+                # Check if article number matches
+                if part_info.get('article_number') != article_num:
+                    continue
+
+                # Calculate text similarity (simple overlap)
+                # Remove whitespace for comparison
+                chunk_clean = ''.join(chunk_preview.split())
+                part_clean = ''.join(part_preview.split())
+
+                if len(chunk_clean) < 50 or len(part_clean) < 50:
+                    continue
+
+                # Check if chunk starts with part text (or vice versa)
+                if chunk_clean.startswith(part_clean[:50]) or part_clean.startswith(chunk_clean[:50]):
+                    score = 100
+                else:
+                    # Calculate character overlap
+                    common = sum(1 for c in chunk_clean[:100] if c in part_clean[:100])
+                    score = common
+
+                if score > best_score:
+                    best_score = score
+                    best_match = part_info
+
+            if best_match and best_score > 30:  # Threshold
+                return {
+                    "parent_article": best_match.get("parent_article"),
+                    "is_nested": best_match.get("is_nested", False),
+                    "hierarchy_level": best_match.get("hierarchy_level", 1),
+                    "article_label": best_match.get("article_label")
+                }
+
+            return None
+
+        except Exception as e:
+            logger.warning("chunk_hierarchy_match_failed", error=str(e))
+            return None
 
     def _normalize_text(self, text: str) -> str:
         """Normalize text (whitespace, unicode, etc.)."""
@@ -147,35 +301,74 @@ class ProfessionalChunker:
 
     def _detect_articles(self, text: str) -> bool:
         """Detect if text contains legal articles."""
-        # Check for multiple article markers
+        # Check for multiple article markers (case-insensitive)
         patterns = [
-            r"Artículo\s+\d+",
-            r"ARTÍCULO\s+\d+",
-            r"Art\.\s+\d+",
-            r"Artículo\s+[IVXLCDM]+",  # Roman numerals
+            r"art[ií]culo\s+\d+",  # Artículo/ARTÍCULO/articulo with number
+            r"art\.\s+\d+",         # Art. with number (marginal notes)
+            r"art[ií]culo\s+[IVXLCDM]+",  # Roman numerals
         ]
 
         matches = 0
         for pattern in patterns:
-            matches += len(re.findall(pattern, text))
+            matches += len(re.findall(pattern, text, re.IGNORECASE))
 
         # If more than 3 articles, treat as legal text
         return matches >= 3
+
+    def _extract_article_number(self, text: str) -> Optional[int]:
+        """
+        Extract article number from text (case-insensitive).
+
+        Supports formats:
+        - "Artículo 1°" or "ARTÍCULO 1°" (with accent)
+        - "ARTICULO 2" (without accent, BCN format)
+        - "Art. 3"
+        - "artículo 123 bis" (lowercase)
+
+        Returns:
+            Article number as integer, or None if not found
+        """
+        # Case-insensitive pattern matching all variants
+        pattern = r"(?:art[ií]culo|art\.)\s+(\d+)"
+
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except (ValueError, IndexError):
+                pass
+
+        return None
 
     def _chunk_by_articles(self, text: str) -> List[str]:
         """
         Chunk by article boundaries (legal text).
 
-        Strategy:
-        1. Split by article markers
-        2. If article > max_size, split further by paragraphs
-        3. If paragraph > max_size, split by sentences
+        IMPROVED STRATEGY for BCN normativa:
+        - Divides ONLY on real article starts: "ARTICULO N°.-" (with dash)
+        - Does NOT divide on marginal notes: "[...Art. N°...]"
+        - Each ARTICLE = 1 complete chunk (unless > article_max_size)
+        - This ensures granular retrieval (article-level, not law-level)
+
+        Example:
+        - Ley 824: 128 articles → 128 chunks (one per article)
+        - Decreto simple: No articles → 1 chunk (semantic boundaries)
+        - Query: "renta devengada" → Returns specific article, not whole law
         """
         chunks = []
 
-        # Split by article boundaries
-        article_pattern = r"(?=(?:Artículo|ARTÍCULO|Art\.)\s+\d+)"
-        articles = re.split(article_pattern, text)
+        # Strategy: Split only on article markers that appear at line start or after punctuation
+        # This avoids splitting on "según el artículo 41, la norma..." (inline reference)
+        # But catches "ARTICULO 1°.-" or "\n\nArticulo 2°.-" (real article)
+        #
+        # Pattern explanation:
+        # (?:^|\n)           - Start of string or newline
+        # (?=                - Lookahead (don't consume)
+        #   (?:ARTICULO|ARTÍCULO|Artículo)  - Article marker (uppercase/title case)
+        #   \s+\d+[°º]       - Space + number + degree symbol
+        # )
+        article_pattern = r"(?:^|\n)(?=(?:ARTICULO|ARTÍCULO|Artículo)\s+\d+[°º])"
+        articles = re.split(article_pattern, text, flags=re.MULTILINE)
 
         for article in articles:
             article = article.strip()
@@ -184,22 +377,355 @@ class ProfessionalChunker:
 
             tokens = self.estimate_tokens(article)
 
-            if tokens <= self.target_chunk_size:
-                # Article fits in one chunk
-                chunks.append(article)
+            # Extract article number for metadata
+            article_num = self._extract_article_number(article)
 
-            elif tokens <= self.max_chunk_size:
-                # Article is larger than target but smaller than max
-                # Keep it as one chunk (preserve article integrity)
+            # Keep article COMPLETE (no 512 token limit)
+            if tokens <= self.article_max_size:
+                # Article complete = 1 chunk
                 chunks.append(article)
-                logger.debug("large_article_kept_intact", tokens=tokens)
+                logger.debug(
+                    "article_chunk_created",
+                    article_number=article_num,
+                    tokens=tokens
+                )
 
             else:
-                # Article too large, split by paragraphs
-                logger.debug("splitting_large_article", tokens=tokens)
+                # Article too large (rare), split by paragraphs WITH OVERLAP
+                logger.warning(
+                    "splitting_very_large_article",
+                    article_number=article_num,
+                    tokens=tokens,
+                    threshold=self.article_max_size
+                )
                 sub_chunks = self._split_by_separator(article, r"\n\n")
+
+                # Add overlap between sub-chunks to preserve legal context
+                if len(sub_chunks) > 1:
+                    sub_chunks = self._add_overlap(sub_chunks, article)
+
                 chunks.extend(sub_chunks)
 
+        return chunks
+
+    def _chunk_by_idparte(self, html: str, hierarchy: dict, base_metadata: Optional[Dict] = None) -> List[Dict]:
+        """
+        Chunk by idParte from HTML with substructure parsing.
+
+        Uses the part_id from the TOC to extract exact article boundaries
+        from the HTML. Then parses each article into incisos, numerales, letras.
+
+        Args:
+            html: Raw HTML
+            hierarchy: Dict mapping part_id -> article metadata
+            base_metadata: Base metadata (norm info) to include in all chunks
+
+        Returns:
+            List of dicts with 'text' and 'metadata' keys
+        """
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            logger.error("beautifulsoup4_not_installed")
+            raise ImportError("beautifulsoup4 required for idParte chunking")
+
+        try:
+            from pipeline.article_parser import parse_article_substructure
+        except ImportError:
+            logger.error("article_parser_not_found")
+            raise ImportError("article_parser required for substructure")
+
+        soup = BeautifulSoup(html, "lxml")
+        chunks = []
+
+        # Get norm metadata for contextual headers
+        norm_citation = base_metadata.get("norm_type", "") + " N° " + str(base_metadata.get("norm_number", ""))
+        norm_title = base_metadata.get("norm_title", "")
+
+        for part_id, part_info in hierarchy.items():
+            # Find div with this ID
+            part_div = soup.find(id=part_id)
+            if not part_div:
+                logger.warning("part_div_not_found", part_id=part_id)
+                continue
+
+            # Extract text
+            article_text = part_div.get_text(separator="\n", strip=True)
+            if not article_text:
+                logger.warning("empty_article_text", part_id=part_id)
+                continue
+
+            # Build base metadata for article
+            article_num = part_info.get("article_number")
+            article_label = part_info.get("article_label", f"Artículo {article_num}")
+
+            base_chunk_metadata = base_metadata.copy() if base_metadata else {}
+            base_chunk_metadata.update({
+                "part_id": part_id,
+                "article_number": article_num,
+                "article_label": article_label,
+                "parent_article": part_info.get("parent_article"),
+                "is_nested": part_info.get("is_nested", False),
+                "hierarchy_level": part_info.get("hierarchy_level", 1),
+            })
+
+            # Parse substructure (incisos, numerales, letras)
+            subparts = parse_article_substructure(article_text)
+
+            if len(subparts) > 1:
+                # Article has substructure, create one chunk per subpart
+                logger.debug(
+                    "article_with_substructure",
+                    part_id=part_id,
+                    article_number=article_num,
+                    total_subparts=len(subparts)
+                )
+
+                for subpart in subparts:
+                    # Build contextual header with substructure info
+                    if subpart.type == "numeral":
+                        subpart_label = f"N°{subpart.number}"
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
+                    elif subpart.type == "letra":
+                        subpart_label = f"letra {subpart.letter})"
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
+                    elif subpart.type == "inciso":
+                        subpart_label = f"inc. {subpart.number}"
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
+                    else:
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
+
+                    full_text = contextual_header + subpart.text
+
+                    # Build metadata for this subpart
+                    chunk_metadata = base_chunk_metadata.copy()
+                    chunk_metadata.update({
+                        "substructure_type": subpart.type,
+                        "numeral": subpart.number if subpart.type == "numeral" else None,
+                        "letra": subpart.letter if subpart.type == "letra" else None,
+                        "inciso": subpart.number if subpart.type == "inciso" else None,
+                    })
+
+                    tokens = self.estimate_tokens(full_text)
+
+                    # Check if subpart is too large
+                    if tokens <= self.article_max_size:
+                        chunks.append({
+                            "text": full_text,
+                            "metadata": chunk_metadata
+                        })
+                        logger.debug(
+                            "subpart_chunk_created",
+                            part_id=part_id,
+                            article_number=article_num,
+                            subpart_type=subpart.type,
+                            subpart_id=f"{subpart.type}_{subpart.number or subpart.letter}",
+                            tokens=tokens
+                        )
+                    else:
+                        # Subpart too large, split by sentences
+                        logger.warning(
+                            "splitting_large_subpart",
+                            part_id=part_id,
+                            article_number=article_num,
+                            subpart_type=subpart.type,
+                            tokens=tokens
+                        )
+                        sub_texts = self._split_by_separator(subpart.text, r"\.\s+")
+                        for sub_text in sub_texts:
+                            full_sub_text = contextual_header + sub_text
+                            chunks.append({
+                                "text": full_sub_text,
+                                "metadata": chunk_metadata.copy()
+                            })
+
+            else:
+                # No substructure or single subpart, treat as whole article
+                contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
+                full_text = contextual_header + article_text
+
+                tokens = self.estimate_tokens(full_text)
+                if tokens <= self.article_max_size:
+                    chunks.append({
+                        "text": full_text,
+                        "metadata": base_chunk_metadata
+                    })
+                    logger.debug(
+                        "article_chunk_no_substructure",
+                        part_id=part_id,
+                        article_number=article_num,
+                        tokens=tokens
+                    )
+                else:
+                    # Article too large, split by paragraphs
+                    logger.warning(
+                        "splitting_large_article_no_substructure",
+                        part_id=part_id,
+                        article_number=article_num,
+                        tokens=tokens
+                    )
+                    sub_chunks_text = self._split_by_separator(article_text, r"\n\n")
+                    for sub_text in sub_chunks_text:
+                        full_sub_text = contextual_header + sub_text
+                        chunks.append({
+                            "text": full_sub_text,
+                            "metadata": base_chunk_metadata.copy()
+                        })
+
+        logger.info("idparte_chunking_complete", total_chunks=len(chunks))
+        return chunks
+
+    def _chunk_by_xml(self, article_texts: Dict[str, str], hierarchy: dict, base_metadata: Optional[Dict] = None) -> List[Dict]:
+        """
+        Chunk by XML article texts (simpler than HTML version).
+
+        Args:
+            article_texts: Dict mapping idParte -> article text
+            hierarchy: Dict mapping idParte -> article metadata
+            base_metadata: Base metadata (norm info) to include in all chunks
+
+        Returns:
+            List of dicts with 'text' and 'metadata' keys
+        """
+        try:
+            from pipeline.article_parser import parse_article_substructure
+        except ImportError:
+            logger.error("article_parser_not_found")
+            raise ImportError("article_parser required for substructure")
+
+        chunks = []
+
+        # Get norm metadata for contextual headers
+        norm_citation = base_metadata.get("norm_type", "") + " N° " + str(base_metadata.get("norm_number", ""))
+        norm_title = base_metadata.get("norm_title", "")
+
+        for part_id, article_text in article_texts.items():
+            # Get hierarchy info
+            part_info = hierarchy.get(part_id)
+            if not part_info:
+                logger.warning("no_hierarchy_for_part", part_id=part_id)
+                continue
+
+            article_num = part_info.get("article_number")
+            article_label = part_info.get("article_label", f"Artículo {article_num}")
+
+            # Build base metadata for article
+            base_chunk_metadata = base_metadata.copy() if base_metadata else {}
+            base_chunk_metadata.update({
+                "part_id": part_id,
+                "article_number": article_num,
+                "article_label": article_label,
+                "parent_article": part_info.get("parent_article"),
+                "is_nested": part_info.get("is_nested", False),
+                "hierarchy_level": part_info.get("hierarchy_level", 1),
+                "vigente": part_info.get("vigente", True),  # ✅ Vigencia from XML!
+                "fecha_version": part_info.get("fecha_version"),
+            })
+
+            # Parse substructure (incisos, numerales, letras)
+            subparts = parse_article_substructure(article_text)
+
+            if len(subparts) > 1:
+                # Article has substructure, create one chunk per subpart
+                logger.debug(
+                    "article_with_substructure",
+                    part_id=part_id,
+                    article_number=article_num,
+                    total_subparts=len(subparts)
+                )
+
+                for subpart in subparts:
+                    # Build contextual header with substructure info
+                    if subpart.type == "numeral":
+                        subpart_label = f"N°{subpart.number}"
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
+                    elif subpart.type == "letra":
+                        subpart_label = f"letra {subpart.letter})"
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
+                    elif subpart.type == "inciso":
+                        subpart_label = f"inc. {subpart.number}"
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
+                    else:
+                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
+
+                    full_text = contextual_header + subpart.text
+
+                    # Build metadata for this subpart
+                    chunk_metadata = base_chunk_metadata.copy()
+                    chunk_metadata.update({
+                        "substructure_type": subpart.type,
+                        "numeral": subpart.number if subpart.type == "numeral" else None,
+                        "letra": subpart.letter if subpart.type == "letra" else None,
+                        "inciso": subpart.number if subpart.type == "inciso" else None,
+                    })
+
+                    tokens = self.estimate_tokens(full_text)
+
+                    # Check if subpart is too large
+                    if tokens <= self.article_max_size:
+                        chunks.append({
+                            "text": full_text,
+                            "metadata": chunk_metadata
+                        })
+                        logger.debug(
+                            "subpart_chunk_created",
+                            part_id=part_id,
+                            article_number=article_num,
+                            subpart_type=subpart.type,
+                            subpart_id=f"{subpart.type}_{subpart.number or subpart.letter}",
+                            tokens=tokens
+                        )
+                    else:
+                        # Subpart too large, split by sentences
+                        logger.warning(
+                            "splitting_large_subpart",
+                            part_id=part_id,
+                            article_number=article_num,
+                            subpart_type=subpart.type,
+                            tokens=tokens
+                        )
+                        sub_texts = self._split_by_separator(subpart.text, r"\.\s+")
+                        for sub_text in sub_texts:
+                            full_sub_text = contextual_header + sub_text
+                            chunks.append({
+                                "text": full_sub_text,
+                                "metadata": chunk_metadata.copy()
+                            })
+
+            else:
+                # No substructure or single subpart, treat as whole article
+                contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
+                full_text = contextual_header + article_text
+
+                tokens = self.estimate_tokens(full_text)
+                if tokens <= self.article_max_size:
+                    chunks.append({
+                        "text": full_text,
+                        "metadata": base_chunk_metadata
+                    })
+                    logger.debug(
+                        "article_chunk_no_substructure",
+                        part_id=part_id,
+                        article_number=article_num,
+                        tokens=tokens
+                    )
+                else:
+                    # Article too large, split by paragraphs
+                    logger.warning(
+                        "splitting_large_article_no_substructure",
+                        part_id=part_id,
+                        article_number=article_num,
+                        tokens=tokens
+                    )
+                    sub_chunks_text = self._split_by_separator(article_text, r"\n\n")
+                    for sub_text in sub_chunks_text:
+                        full_sub_text = contextual_header + sub_text
+                        chunks.append({
+                            "text": full_sub_text,
+                            "metadata": base_chunk_metadata.copy()
+                        })
+
+        logger.info("xml_chunking_complete", total_chunks=len(chunks))
         return chunks
 
     def _chunk_by_semantic_boundaries(self, text: str) -> List[str]:
@@ -255,7 +781,12 @@ class ProfessionalChunker:
         return chunks
 
     def _split_by_separator(self, text: str, separator: str) -> List[str]:
-        """Split text by separator, respecting size limits."""
+        """
+        Split text by separator, respecting size limits.
+
+        For legal text: if a paragraph exceeds max_chunk_size, split it
+        into equal parts to preserve maximum context.
+        """
         chunks = []
         current_chunk = ""
         current_tokens = 0
@@ -269,6 +800,30 @@ class ProfessionalChunker:
 
             part_tokens = self.estimate_tokens(part)
 
+            # If this paragraph alone exceeds max_chunk_size
+            if part_tokens > self.max_chunk_size:
+                # Flush current chunk
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                    current_tokens = 0
+
+                # Split large paragraph into equal parts
+                # Calculate how many sub-chunks we need
+                num_subchunks = (part_tokens // self.max_chunk_size) + 1
+                chars_per_chunk = len(part) // num_subchunks
+
+                for i in range(num_subchunks):
+                    start = i * chars_per_chunk
+                    end = (i + 1) * chars_per_chunk if i < num_subchunks - 1 else len(part)
+                    sub_part = part[start:end].strip()
+
+                    if sub_part:
+                        chunks.append(sub_part)
+
+                continue
+
+            # Normal case: try to add to current chunk
             if current_tokens + part_tokens <= self.max_chunk_size:
                 current_chunk += " " + part if current_chunk else part
                 current_tokens += part_tokens
