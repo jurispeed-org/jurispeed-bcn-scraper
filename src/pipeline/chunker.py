@@ -13,6 +13,7 @@ import re
 import structlog
 from typing import List, Dict, Optional
 from dataclasses import dataclass
+from core.xml_parser import BCNXMLParser
 
 logger = structlog.get_logger()
 
@@ -135,9 +136,30 @@ class ProfessionalChunker:
         # Use idParte-based chunking if hierarchy available
         if has_articles and hierarchy:
             if article_texts:
-                # XML path
+                # XML path with structural context
                 logger.info("chunking_by_xml_idparte", total_parts=len(hierarchy))
-                chunks = self._chunk_by_xml(article_texts, hierarchy, metadata)
+
+                # Extract structural context (book/title/section) for each article
+                structural_context = {}
+                if xml_content and norm_id:
+                    try:
+                        from core.xml_parser import BCNXMLParser
+                        parser = BCNXMLParser()
+                        structural_context = parser.extract_structural_context(xml_content, norm_id)
+                        logger.info("structural_context_loaded", articles_with_context=len(structural_context))
+                    except Exception as e:
+                        logger.warning("structural_context_extraction_failed", error=str(e))
+
+                # Chunk articles with structural context
+                article_chunks = self._chunk_by_xml(article_texts, hierarchy, metadata, structural_context)
+
+                # NO special chunks - ruta viaja CON el articulo
+                chunks = article_chunks
+
+                logger.info(
+                    "chunking_complete",
+                    total_chunks=len(chunks)
+                )
             elif html:
                 # HTML path (legacy)
                 logger.info("chunking_by_html_idparte", total_parts=len(hierarchy))
@@ -410,10 +432,12 @@ class ProfessionalChunker:
 
     def _chunk_by_idparte(self, html: str, hierarchy: dict, base_metadata: Optional[Dict] = None) -> List[Dict]:
         """
+        DEPRECATED: Legacy HTML chunking (XML path preferred).
+
         Chunk by idParte from HTML with substructure parsing.
 
         Uses the part_id from the TOC to extract exact article boundaries
-        from the HTML. Then parses each article into incisos, numerales, letras.
+        from the HTML. Then parses each article into numerales, letras (NO incisos).
 
         Args:
             html: Raw HTML
@@ -460,6 +484,38 @@ class ProfessionalChunker:
             article_label = part_info.get("article_label", f"Artículo {article_num}")
 
             base_chunk_metadata = base_metadata.copy() if base_metadata else {}
+
+            # Build article-specific URL with idParte
+            article_url = base_chunk_metadata.get("official_url", "")
+            if article_url:
+                # Convert Pydantic Url to string if needed
+                article_url_str = str(article_url) if not isinstance(article_url, str) else article_url
+                if part_id:
+                    # Add idParte parameter to URL for direct article linking
+                    if "?" in article_url_str:
+                        article_url = f"{article_url_str}&idParte={part_id}"
+                    else:
+                        article_url = f"{article_url_str}?idParte={part_id}"
+                else:
+                    article_url = article_url_str
+
+            # Extract validity info (if available from hierarchy)
+            version_date = part_info.get("version_date")
+            in_force = part_info.get("in_force", True)
+
+            # Check for deferred validity (future fechaVersion)
+            if BCNXMLParser.is_future_version(fecha_version):
+                in_force = False  # Override: not yet in effect
+                force_status = "deferred"
+                logger.debug(
+                    "deferred_validity_detected",
+                    part_id=part_id,
+                    article_number=article_num,
+                    version_date=version_date
+                )
+            else:
+                force_status = "active" if in_force else "repealed"
+
             base_chunk_metadata.update({
                 "part_id": part_id,
                 "article_number": article_num,
@@ -467,12 +523,16 @@ class ProfessionalChunker:
                 "parent_article": part_info.get("parent_article"),
                 "is_nested": part_info.get("is_nested", False),
                 "hierarchy_level": part_info.get("hierarchy_level", 1),
+                "in_force": in_force,
+                "force_status": force_status,
+                "version_date": version_date,
+                "official_url": article_url,  # Override with article-specific URL
             })
 
-            # Parse substructure (incisos, numerales, letras)
+            # Parse substructure (only numerales and letras, NO incisos)
             subparts = parse_article_substructure(article_text)
 
-            if len(subparts) > 1:
+            if len(subparts) >= 1:
                 # Article has substructure, create one chunk per subpart
                 logger.debug(
                     "article_with_substructure",
@@ -482,18 +542,14 @@ class ProfessionalChunker:
                 )
 
                 for subpart in subparts:
-                    # Build contextual header with substructure info
-                    if subpart.type == "numeral":
-                        subpart_label = f"N°{subpart.number}"
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
-                    elif subpart.type == "letra":
-                        subpart_label = f"letra {subpart.letter})"
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
-                    elif subpart.type == "inciso":
-                        subpart_label = f"inc. {subpart.number}"
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
-                    else:
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
+                    # Build contextual header with FULL structural path
+                    # CRITICAL: Include book/title/section names in text for:
+                    # 1. BM25 lexical search (e.g., "femicidio" only exists in section_name)
+                    # 2. Reranker visibility (reranker reads text, not metadata)
+                    # 3. Semantic embeddings (model embeds full context)
+                    contextual_header = self._build_full_contextual_header(
+                        norm_citation, norm_title, context, article_label, subpart
+                    )
 
                     full_text = contextual_header + subpart.text
 
@@ -503,7 +559,6 @@ class ProfessionalChunker:
                         "substructure_type": subpart.type,
                         "numeral": subpart.number if subpart.type == "numeral" else None,
                         "letra": subpart.letter if subpart.type == "letra" else None,
-                        "inciso": subpart.number if subpart.type == "inciso" else None,
                     })
 
                     tokens = self.estimate_tokens(full_text)
@@ -541,7 +596,9 @@ class ProfessionalChunker:
 
             else:
                 # No substructure or single subpart, treat as whole article
-                contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
+                contextual_header = self._build_full_contextual_header(
+                    norm_citation, norm_title, context, article_label, None
+                )
                 full_text = contextual_header + article_text
 
                 tokens = self.estimate_tokens(full_text)
@@ -575,17 +632,28 @@ class ProfessionalChunker:
         logger.info("idparte_chunking_complete", total_chunks=len(chunks))
         return chunks
 
-    def _chunk_by_xml(self, article_texts: Dict[str, str], hierarchy: dict, base_metadata: Optional[Dict] = None) -> List[Dict]:
+    def _chunk_by_xml(
+        self,
+        article_texts: Dict[str, str],
+        hierarchy: dict,
+        base_metadata: Optional[Dict] = None,
+        structural_context: Optional[Dict[str, Dict]] = None
+    ) -> List[Dict]:
         """
-        Chunk by XML article texts (simpler than HTML version).
+        Chunk by XML article texts with full structural context.
 
         Args:
             article_texts: Dict mapping idParte -> article text
             hierarchy: Dict mapping idParte -> article metadata
             base_metadata: Base metadata (norm info) to include in all chunks
+            structural_context: Dict mapping idParte -> structural context (book/title/section)
 
         Returns:
             List of dicts with 'text' and 'metadata' keys
+
+        CRITICAL: Structural context must be in BOTH text and metadata:
+        - Text: for BM25 lexical search and reranker visibility
+        - Metadata: for filters and citation construction
         """
         try:
             from pipeline.article_parser import parse_article_substructure
@@ -594,6 +662,7 @@ class ProfessionalChunker:
             raise ImportError("article_parser required for substructure")
 
         chunks = []
+        structural_context = structural_context or {}
 
         # Get norm metadata for contextual headers
         norm_citation = base_metadata.get("norm_type", "") + " N° " + str(base_metadata.get("norm_number", ""))
@@ -611,6 +680,41 @@ class ProfessionalChunker:
 
             # Build base metadata for article
             base_chunk_metadata = base_metadata.copy() if base_metadata else {}
+
+            # Build article-specific URL with idParte
+            article_url = base_chunk_metadata.get("official_url", "")
+            if article_url:
+                # Convert Pydantic Url to string if needed
+                article_url_str = str(article_url) if not isinstance(article_url, str) else article_url
+                if part_id:
+                    # Add idParte parameter to URL for direct article linking
+                    if "?" in article_url_str:
+                        article_url = f"{article_url_str}&idParte={part_id}"
+                    else:
+                        article_url = f"{article_url_str}?idParte={part_id}"
+                else:
+                    article_url = article_url_str
+
+            # Extract validity/force info
+            version_date = part_info.get("version_date")
+            in_force = part_info.get("in_force", True)
+
+            # Check for deferred validity (future version date)
+            if BCNXMLParser.is_future_version(version_date):
+                in_force = False  # Override: not yet in effect
+                force_status = "deferred"
+                logger.debug(
+                    "deferred_validity_detected",
+                    part_id=part_id,
+                    article_number=article_num,
+                    version_date=version_date
+                )
+            else:
+                force_status = "active" if in_force else "repealed"
+
+            # Get structural context for this article
+            context = structural_context.get(part_id, {})
+
             base_chunk_metadata.update({
                 "part_id": part_id,
                 "article_number": article_num,
@@ -618,115 +722,281 @@ class ProfessionalChunker:
                 "parent_article": part_info.get("parent_article"),
                 "is_nested": part_info.get("is_nested", False),
                 "hierarchy_level": part_info.get("hierarchy_level", 1),
-                "vigente": part_info.get("vigente", True),  # ✅ Vigencia from XML!
-                "fecha_version": part_info.get("fecha_version"),
+                "in_force": in_force,
+                "force_status": force_status,
+                "version_date": version_date,
+                "official_url": article_url,  # Override with article-specific URL
+                # Structural context (CRITICAL for filters and citations)
+                "book": context.get("book"),
+                "book_name": context.get("book_name"),
+                "title_ordinal": context.get("title_ordinal"),
+                "title_name": context.get("title_name"),
+                "section": context.get("section"),
+                "section_name": context.get("section_name"),
             })
 
-            # Parse substructure (incisos, numerales, letras)
-            subparts = parse_article_substructure(article_text)
+            # Extract subdivisions (numerales, letras) as metadata ONLY
+            # Keep article COMPLETE - do NOT split
+            from pipeline.article_parser import extract_subdivisions_metadata
+            subdivisions = extract_subdivisions_metadata(article_text)
 
-            if len(subparts) > 1:
-                # Article has substructure, create one chunk per subpart
+            # Build contextual header with FULL structural path
+            # Use · separator for cleaner hierarchy display
+            contextual_header = self._build_contextual_header_with_dot_separator(
+                norm_citation, norm_title, context, article_label
+            )
+            full_text = contextual_header + article_text
+
+            # Build structured path for metadata
+            structured_path = self._build_structured_path(context)
+
+            # Build formatted citation
+            formatted_citation = self._build_formatted_citation(
+                norm_citation, article_label, context
+            )
+
+            # Build metadata with new structure
+            chunk_metadata = base_chunk_metadata.copy()
+            chunk_metadata.update({
+                "literal_text": article_text,  # Article text without header
+                "subdivisions": subdivisions,   # List of subdivision positions
+                "path": structured_path,        # Hierarchical path as nested dict
+                "formatted_citation": formatted_citation,  # Formal citation
+            })
+
+            tokens = self.estimate_tokens(full_text)
+            if tokens <= self.article_max_size:
+                chunks.append({
+                    "text": full_text,
+                    "metadata": chunk_metadata
+                })
                 logger.debug(
-                    "article_with_substructure",
+                    "article_chunk_created",
                     part_id=part_id,
                     article_number=article_num,
-                    total_subparts=len(subparts)
+                    tokens=tokens,
+                    subdivisions=len(subdivisions)
                 )
-
-                for subpart in subparts:
-                    # Build contextual header with substructure info
-                    if subpart.type == "numeral":
-                        subpart_label = f"N°{subpart.number}"
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
-                    elif subpart.type == "letra":
-                        subpart_label = f"letra {subpart.letter})"
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
-                    elif subpart.type == "inciso":
-                        subpart_label = f"inc. {subpart.number}"
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}, {subpart_label}:\n\n"
-                    else:
-                        contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
-
-                    full_text = contextual_header + subpart.text
-
-                    # Build metadata for this subpart
-                    chunk_metadata = base_chunk_metadata.copy()
-                    chunk_metadata.update({
-                        "substructure_type": subpart.type,
-                        "numeral": subpart.number if subpart.type == "numeral" else None,
-                        "letra": subpart.letter if subpart.type == "letra" else None,
-                        "inciso": subpart.number if subpart.type == "inciso" else None,
-                    })
-
-                    tokens = self.estimate_tokens(full_text)
-
-                    # Check if subpart is too large
-                    if tokens <= self.article_max_size:
-                        chunks.append({
-                            "text": full_text,
-                            "metadata": chunk_metadata
-                        })
-                        logger.debug(
-                            "subpart_chunk_created",
-                            part_id=part_id,
-                            article_number=article_num,
-                            subpart_type=subpart.type,
-                            subpart_id=f"{subpart.type}_{subpart.number or subpart.letter}",
-                            tokens=tokens
-                        )
-                    else:
-                        # Subpart too large, split by sentences
-                        logger.warning(
-                            "splitting_large_subpart",
-                            part_id=part_id,
-                            article_number=article_num,
-                            subpart_type=subpart.type,
-                            tokens=tokens
-                        )
-                        sub_texts = self._split_by_separator(subpart.text, r"\.\s+")
-                        for sub_text in sub_texts:
-                            full_sub_text = contextual_header + sub_text
-                            chunks.append({
-                                "text": full_sub_text,
-                                "metadata": chunk_metadata.copy()
-                            })
-
             else:
-                # No substructure or single subpart, treat as whole article
-                contextual_header = f"{norm_citation}, {norm_title}, {article_label}:\n\n"
-                full_text = contextual_header + article_text
-
-                tokens = self.estimate_tokens(full_text)
-                if tokens <= self.article_max_size:
+                # Article too large (rare), split by paragraphs as fallback
+                logger.warning(
+                    "splitting_large_article",
+                    part_id=part_id,
+                    article_number=article_num,
+                    tokens=tokens
+                )
+                sub_chunks_text = self._split_by_separator(article_text, r"\n\n")
+                for sub_text in sub_chunks_text:
+                    full_sub_text = contextual_header + sub_text
                     chunks.append({
-                        "text": full_text,
-                        "metadata": base_chunk_metadata
+                        "text": full_sub_text,
+                        "metadata": chunk_metadata.copy()
                     })
-                    logger.debug(
-                        "article_chunk_no_substructure",
-                        part_id=part_id,
-                        article_number=article_num,
-                        tokens=tokens
-                    )
-                else:
-                    # Article too large, split by paragraphs
-                    logger.warning(
-                        "splitting_large_article_no_substructure",
-                        part_id=part_id,
-                        article_number=article_num,
-                        tokens=tokens
-                    )
-                    sub_chunks_text = self._split_by_separator(article_text, r"\n\n")
-                    for sub_text in sub_chunks_text:
-                        full_sub_text = contextual_header + sub_text
-                        chunks.append({
-                            "text": full_sub_text,
-                            "metadata": base_chunk_metadata.copy()
-                        })
 
         logger.info("xml_chunking_complete", total_chunks=len(chunks))
         return chunks
+
+    def _extract_special_chunks(
+        self,
+        full_content: str,
+        article_texts: Dict[str, str],
+        base_metadata: Optional[Dict] = None
+    ) -> List[Dict]:
+        """
+        Extract non-article content (preambulo, structural headers) as special chunks.
+
+        Identifies:
+        - Preambulo: Text before first article (decrees, signatures, certifications)
+        - Structural headers: LIBRO, TÍTULO, §, etc.
+
+        Args:
+            full_content: Complete document text
+            article_texts: Dict of part_id -> article text
+            base_metadata: Base metadata to include
+
+        Returns:
+            List of special chunks with type metadata
+        """
+        special_chunks = []
+
+        # Get norm metadata for contextual headers
+        norm_citation = base_metadata.get("norm_type", "") + " N° " + str(base_metadata.get("norm_number", ""))
+        norm_title = base_metadata.get("norm_title", "")
+
+        # Combine all article texts to find what's NOT in articles
+        all_article_text = "\n\n".join(article_texts.values())
+
+        # Split full_content into paragraphs
+        paragraphs = full_content.split('\n\n')
+
+        # Track current structural context
+        current_book = None
+        current_title = None
+        current_section = None
+
+        preambulo_parts = []
+        in_preambulo = True
+
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+
+            # FIRST: Check for structural headers (LIBRO, TÍTULO, §)
+            # These must be detected BEFORE checking if in article
+            is_structural_header = False
+            header_type = None
+            header_label = None
+
+            # LIBRO pattern
+            book_match = re.match(r'^LIBRO\s+(PRIMERO|SEGUNDO|TERCERO|CUARTO|QUINTO|I{1,4}|[IVX]+)', paragraph, re.IGNORECASE)
+            if book_match:
+                current_book = paragraph
+                is_structural_header = True
+                header_type = "book"
+                header_label = paragraph
+
+            # TÍTULO pattern (only if not LIBRO)
+            if not is_structural_header:
+                title_match = re.match(r'^TÍ?TULO\s+(PRIMERO|PRELIMINAR|I{1,4}|[IVX]+|\d+)', paragraph, re.IGNORECASE)
+                if title_match:
+                    current_title = paragraph
+                    is_structural_header = True
+                    header_type = "title"
+                    header_label = paragraph
+
+            # § (section/paragraph) pattern (only if not LIBRO or TÍTULO)
+            if not is_structural_header:
+                section_match = re.match(r'^§\s*(\d+|[IVX]+)', paragraph, re.IGNORECASE)
+                if section_match:
+                    current_section = paragraph
+                    is_structural_header = True
+                    header_type = "section"
+                    header_label = paragraph
+
+            # If structural header found, end preambulo and create header chunk
+            if is_structural_header:
+                # End preambulo if we're in it
+                if in_preambulo and preambulo_parts:
+                    preambulo_text = "\n\n".join(preambulo_parts)
+                    contextual_header = f"{norm_citation}, {norm_title}, Preámbulo:\n\n"
+                    full_text = contextual_header + preambulo_text
+
+                    tokens = self.estimate_tokens(full_text)
+                    chunk_metadata = base_metadata.copy() if base_metadata else {}
+                    chunk_metadata.update({
+                        "chunk_type": "preambulo",
+                        "article_number": None,
+                        "part_id": None,
+                        "in_force": True,
+                    })
+
+                    special_chunks.append({
+                        "text": full_text,
+                        "metadata": chunk_metadata
+                    })
+
+                    logger.debug("preambulo_chunk_created", tokens=tokens)
+                    preambulo_parts = []
+
+                in_preambulo = False
+
+                # Build contextual header with current structural hierarchy
+                context_parts = [norm_citation, norm_title]
+                if current_book and header_type != "book":
+                    context_parts.append(current_book)
+                if current_title and header_type not in ["book", "title"]:
+                    context_parts.append(current_title)
+
+                contextual_header = ", ".join(context_parts) + f", {header_label}:\n\n"
+                full_text = contextual_header + paragraph
+
+                tokens = self.estimate_tokens(full_text)
+                chunk_metadata = base_metadata.copy() if base_metadata else {}
+                chunk_metadata.update({
+                    "chunk_type": header_type,
+                    "structural_header": header_label,
+                    "book": current_book,
+                    "title_ordinal": current_title,
+                    "section": current_section,
+                    "article_number": None,
+                    "part_id": None,
+                    "in_force": True,
+                })
+
+                special_chunks.append({
+                    "text": full_text,
+                    "metadata": chunk_metadata
+                })
+
+                logger.debug(
+                    "structural_header_chunk_created",
+                    header_type=header_type,
+                    header_label=header_label[:50],
+                    tokens=tokens
+                )
+
+                continue  # Move to next paragraph
+
+            # Not a structural header - check if in article or preambulo
+            para_signature = paragraph[:100] if len(paragraph) > 100 else paragraph
+            is_in_article = para_signature in all_article_text
+
+            if is_in_article:
+                # End of preambulo
+                if in_preambulo and preambulo_parts:
+                    preambulo_text = "\n\n".join(preambulo_parts)
+                    contextual_header = f"{norm_citation}, {norm_title}, Preámbulo:\n\n"
+                    full_text = contextual_header + preambulo_text
+
+                    tokens = self.estimate_tokens(full_text)
+                    chunk_metadata = base_metadata.copy() if base_metadata else {}
+                    chunk_metadata.update({
+                        "chunk_type": "preambulo",
+                        "article_number": None,
+                        "part_id": None,
+                        "in_force": True,
+                    })
+
+                    special_chunks.append({
+                        "text": full_text,
+                        "metadata": chunk_metadata
+                    })
+
+                    logger.debug("preambulo_chunk_created", tokens=tokens)
+                    preambulo_parts = []
+
+                in_preambulo = False
+                continue
+
+            # Not structural header, not in article -> must be preambulo
+            if in_preambulo:
+                preambulo_parts.append(paragraph)
+
+        # Handle remaining preambulo if document has no articles
+        if in_preambulo and preambulo_parts:
+            preambulo_text = "\n\n".join(preambulo_parts)
+            contextual_header = f"{norm_citation}, {norm_title}, Preámbulo:\n\n"
+            full_text = contextual_header + preambulo_text
+
+            tokens = self.estimate_tokens(full_text)
+            chunk_metadata = base_metadata.copy() if base_metadata else {}
+            chunk_metadata.update({
+                "chunk_type": "preambulo",
+                "article_number": None,
+                "part_id": None,
+                "in_force": True,
+            })
+
+            special_chunks.append({
+                "text": full_text,
+                "metadata": chunk_metadata
+            })
+
+            logger.debug("preambulo_chunk_created_end", tokens=tokens)
+
+        logger.info("special_chunks_extracted", total=len(special_chunks))
+        return special_chunks
 
     def _chunk_by_semantic_boundaries(self, text: str) -> List[str]:
         """
@@ -883,6 +1153,177 @@ class ProfessionalChunker:
             return cutoff[sentence_start + 2 :]
 
         return cutoff
+
+    def _build_contextual_header_with_dot_separator(
+        self,
+        norm_citation: str,
+        norm_title: str,
+        context: Dict,
+        article_label: str
+    ) -> str:
+        """
+        Build contextual header with · (middot) separators for hierarchy.
+
+        Example: "Código Penal · Libro Segundo · Título Octavo · §1 bis · Artículo 390 ter\n\n"
+
+        CRITICAL: Includes full structural names in text for BM25 and reranker.
+        """
+        parts = [norm_citation]
+
+        # Add structural hierarchy with names
+        if context.get("book"):
+            book_full = context["book"]
+            if context.get("book_name"):
+                book_full += f" ({context['book_name']})"
+            parts.append(book_full)
+
+        if context.get("title_ordinal"):
+            title_full = context["title_ordinal"]
+            if context.get("title_name"):
+                title_full += f" ({context['title_name']})"
+            parts.append(title_full)
+
+        if context.get("section"):
+            section_full = context["section"]
+            if context.get("section_name"):
+                section_full += f" - {context['section_name']}"
+            parts.append(section_full)
+
+        # Add article
+        parts.append(f"Artículo {article_label}")
+
+        # Join with · separator
+        header = " · ".join(parts)
+        return f"{header}\n\n"
+
+    def _build_structured_path(self, context: Dict) -> Dict:
+        """
+        Build structured path as nested dictionary.
+
+        Returns:
+            {
+                "book": {"ordinal": "LIBRO SEGUNDO", "name": "..."},
+                "title": {"ordinal": "TITULO OCTAVO", "name": "..."},
+                "section": {"ordinal": "§1 bis", "name": "Del femicidio"}
+            }
+        """
+        path = {}
+
+        if context.get("book"):
+            path["book"] = {
+                "ordinal": context["book"],
+                "name": context.get("book_name", "")
+            }
+
+        if context.get("title_ordinal"):
+            path["title"] = {
+                "ordinal": context["title_ordinal"],
+                "name": context.get("title_name", "")
+            }
+
+        if context.get("section"):
+            path["section"] = {
+                "ordinal": context["section"],
+                "name": context.get("section_name", "")
+            }
+
+        return path
+
+    def _build_formatted_citation(
+        self,
+        norm_citation: str,
+        article_label: str,
+        context: Dict
+    ) -> str:
+        """
+        Build formal legal citation.
+
+        Example: "Código Penal, Artículo 390 ter"
+        Example with structure: "Código Penal, Libro Segundo, Título Octavo, §1 bis, Artículo 390 ter"
+        """
+        citation_parts = [norm_citation]
+
+        if context.get("book"):
+            citation_parts.append(context["book"])
+        if context.get("title_ordinal"):
+            citation_parts.append(context["title_ordinal"])
+        if context.get("section"):
+            citation_parts.append(context["section"])
+
+        citation_parts.append(f"Artículo {article_label}")
+
+        return ", ".join(citation_parts)
+
+    def _build_full_contextual_header(
+        self,
+        norm_citation: str,
+        norm_title: str,
+        context: Dict,
+        article_label: str,
+        subpart: Optional[any] = None
+    ) -> str:
+        """
+        Build full contextual header with complete structural path.
+
+        CRITICAL: This puts book/title/section NAMES in the text, not just metadata.
+
+        Why in text:
+        - BM25 lexical search: "femicidio" only exists in section_name
+        - Reranker: reads text, not metadata
+        - Embeddings: model embeds full context
+
+        Example output:
+        "Código Penal, Libro Segundo, Crímenes y simples delitos contra las personas,
+         Del femicidio, artículo 390 ter:"
+
+        Args:
+            norm_citation: e.g., "Código Penal"
+            norm_title: Full norm title
+            context: Structural context dict with book/title/section
+            article_label: e.g., "390 ter"
+            subpart: Optional subpart (numeral or letra, NO inciso)
+
+        Returns:
+            Full contextual header string
+        """
+        path_parts = [norm_citation]
+
+        # Add structural path with NAMES (not just ordinals)
+        if context.get("book"):
+            # Include both ordinal and name: "Libro Segundo, Crímenes y simples delitos..."
+            book_full = context["book"]
+            if context.get("book_name"):
+                book_full += f", {context['book_name']}"
+            path_parts.append(book_full)
+
+        if context.get("title_ordinal"):
+            # Include both ordinal and name
+            title_full = context["title_ordinal"]
+            if context.get("title_name"):
+                title_full += f", {context['title_name']}"
+            path_parts.append(title_full)
+
+        if context.get("section"):
+            # Include both ordinal and name: "§1 bis, Del femicidio"
+            section_full = context["section"]
+            if context.get("section_name"):
+                section_full += f", {context['section_name']}"
+            path_parts.append(section_full)
+
+        # Add article
+        path_parts.append(f"artículo {article_label}")
+
+        # Add subpart if present (only numerales and letras, NO incisos)
+        if subpart:
+            if subpart.type == "numeral":
+                path_parts.append(f"N°{subpart.number}")
+            elif subpart.type == "letra":
+                path_parts.append(f"letra {subpart.letter})")
+
+        # Join with comma-space
+        header = ", ".join(path_parts) + ":\n\n"
+
+        return header
 
 
 # Convenience function

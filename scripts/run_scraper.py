@@ -133,6 +133,10 @@ class ProductionScraper:
                 if norm:
                     # Fetch XML again for chunking (necessary for subestructura)
                     xml_content = await self.scraper._fetch_xml(norm_id, timeout=30)
+
+                    # Detect if this is a texto refundido and mark originals
+                    self._detect_and_mark_refundicion(norm, xml_content)
+
                     await self._store_norm(norm, xml_content)
                 else:
                     # Track failed norm for retry logic
@@ -281,6 +285,87 @@ class ProductionScraper:
             data["total_chunks"] = 0
 
         return data
+
+    def _detect_and_mark_refundicion(self, norm: ChileanLegalNorm, xml_content: str):
+        """
+        Detect if this norm is a texto refundido and mark original as refundida.
+
+        Checks if title contains "TEXTO REFUNDIDO" and extracts which law it refunds
+        from <Materia> tags in XML.
+
+        Args:
+            norm: The current norm being processed
+            xml_content: Raw XML content
+        """
+        import re
+
+        # Check if this is a texto refundido
+        title_upper = norm.title.upper()
+        is_refundido = any(phrase in title_upper for phrase in [
+            "TEXTO REFUNDIDO",
+            "FIJA TEXTO REFUNDIDO",
+            "FIJA EL TEXTO REFUNDIDO"
+        ])
+
+        if not is_refundido or not xml_content:
+            return
+
+        logger.info(
+            "texto_refundido_detected",
+            norm_id=norm.norm_id,
+            title=norm.title[:100]
+        )
+
+        # Extract original law number from <Materia>
+        # Example: <Materia>Ley no. 18.290</Materia>
+        materia_pattern = r'<Materia>Ley\s+no?\.\s*(\d+[\.\d]*)</Materia>'
+        matches = re.findall(materia_pattern, xml_content, re.IGNORECASE)
+
+        if not matches:
+            logger.warning(
+                "refundido_no_materia_found",
+                norm_id=norm.norm_id,
+                title=norm.title[:100]
+            )
+            return
+
+        # Get unique law numbers
+        law_numbers = list(set(matches))
+
+        logger.info(
+            "refundicion_laws_extracted",
+            norm_id=norm.norm_id,
+            law_numbers=law_numbers
+        )
+
+        # For each law number, store in DynamoDB
+        # Cleanup script will resolve law_number -> norm_id later
+        for law_num in law_numbers:
+            # Clean law number (remove dots: "18.290" -> "18290")
+            law_num_clean = law_num.replace(".", "")
+
+            try:
+                # Store in DynamoDB with law number
+                # Cleanup script will query BCN API to get norm_id
+                self.norm_tracker.mark_refundida(
+                    refundido_por=norm.norm_id,
+                    refundida_law_number=law_num_clean,
+                    reason=f"Detectado: TEXTO REFUNDIDO en {norm.title[:80]}"
+                )
+
+                logger.info(
+                    "refundicion_stored",
+                    refundido_por=norm.norm_id,
+                    refundida_law_number=law_num_clean
+                )
+
+            except Exception as e:
+                logger.error(
+                    "refundicion_storage_error",
+                    refundido_por=norm.norm_id,
+                    law_num=law_num,
+                    error=str(e)
+                )
 
     async def _store_norm(self, norm: ChileanLegalNorm, xml_content: str = None) -> None:
         """

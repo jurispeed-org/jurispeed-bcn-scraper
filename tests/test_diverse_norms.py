@@ -27,12 +27,11 @@ logger = structlog.get_logger()
 
 # Test norm IDs (diverse types)
 TEST_NORM_IDS = [
-    242302  # Single test for validation
-    # 242302, 1183363, 30667, 1041361, 6368, 207436, 5605, 1984, 1973,
-    # 1048783, 1076172, 1210553, 1219810, 1165383, 1110541, 1162349,
-    # 1115996, 262713, 270676, 284669, 147871, 227327, 194255, 1220178,
-    # 222071, 1068465, 1062100, 1160481, 1123747, 1194869, 1063938,
-    # 1080094, 30692
+    242302, 1183363, 30667, 1041361, 6368, 207436, 5605, 1984, 1973,
+    1048783, 1076172, 1210553, 1219810, 1165383, 1110541, 1162349,
+    1115996, 262713, 270676, 284669, 147871, 227327, 194255, 1220178,
+    222071, 1068465, 1062100, 1160481, 1123747, 1194869, 1063938,
+    1080094, 30692
 ]
 
 
@@ -91,7 +90,9 @@ async def test_norm(
 
         if data["chunks"]:
             result["avg_tokens"] = sum(c["token_count"] for c in data["chunks"]) / len(data["chunks"])
-            chunks_with_sub = sum(1 for c in data["chunks"] if c["metadata"].get("substructure_type"))
+            # Count chunks with subdivisions (numerales/letras)
+            chunks_with_sub = sum(1 for c in data["chunks"]
+                                  if c["metadata"].get("subdivisions") and len(c["metadata"]["subdivisions"]) > 0)
             result["chunks_with_substructure"] = chunks_with_sub
             result["substructure_pct"] = (chunks_with_sub / len(data["chunks"]) * 100)
             result["nested_chunks"] = sum(1 for c in data["chunks"] if c["metadata"].get("is_nested"))
@@ -183,12 +184,12 @@ async def main():
 
             # Rate limiting (conservative to avoid ban)
             import random
-            wait_time = random.uniform(5, 8)  # 5-8 seconds between requests
+            wait_time = random.uniform(10, 15)  # 10-15 seconds between requests (increased from 5-8)
 
             # Extra pause every 10 requests
             if i % 10 == 0:
-                print(f"\n  [PAUSE] Cooling down 30 seconds after {i} requests...")
-                await asyncio.sleep(30)
+                print(f"\n  [PAUSE] Cooling down 60 seconds after {i} requests...")
+                await asyncio.sleep(60)  # Increased from 30s to 60s
 
             await asyncio.sleep(wait_time)
 

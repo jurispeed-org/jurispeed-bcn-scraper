@@ -25,6 +25,27 @@ class BCNXMLParser:
     # XML namespace
     NS = {'ns': 'http://www.leychile.cl/esquemas'}
 
+    @staticmethod
+    def is_future_version(version_date_str: Optional[str]) -> bool:
+        """
+        Check if version date is in the future (deferred validity).
+
+        Args:
+            version_date_str: ISO format date string (YYYY-MM-DD)
+
+        Returns:
+            True if date is in the future, False otherwise
+        """
+        if not version_date_str:
+            return False
+
+        try:
+            parsed_date = date.fromisoformat(version_date_str)
+            return parsed_date > date.today()
+        except (ValueError, TypeError):
+            logger.warning("invalid_version_date", version_date=version_date_str)
+            return False
+
     def parse(self, xml_content: str, norm_id: int) -> Optional[ChileanLegalNorm]:
         """
         Parse XML to ChileanLegalNorm.
@@ -75,58 +96,58 @@ class BCNXMLParser:
             if identificador is None:
                 return None
 
-            # Dates (both optional - some norms don't have fechaPublicacion)
-            fecha_promulgacion = identificador.get('fechaPromulgacion')
-            fecha_publicacion = identificador.get('fechaPublicacion')
+            # Dates (both optional - some norms don't have publication date)
+            promulgation_date_str = identificador.get('fechaPromulgacion')
+            publication_date_str = identificador.get('fechaPublicacion')
 
-            promulgation_date = date.fromisoformat(fecha_promulgacion) if fecha_promulgacion else None
-            publication_date = date.fromisoformat(fecha_publicacion) if fecha_publicacion else None
+            promulgation_date = date.fromisoformat(promulgation_date_str) if promulgation_date_str else None
+            publication_date = date.fromisoformat(publication_date_str) if publication_date_str else None
 
             # If no publication date, use promulgation or version date as fallback
             if not publication_date:
-                fecha_version = root.get('fechaVersion')
-                publication_date = promulgation_date or (date.fromisoformat(fecha_version) if fecha_version else date.today())
+                version_date_str = root.get('fechaVersion')
+                publication_date = promulgation_date or (date.fromisoformat(version_date_str) if version_date_str else date.today())
 
             # Last modified (from root)
-            fecha_version = root.get('fechaVersion')
-            last_modified = date.fromisoformat(fecha_version) if fecha_version else None
+            version_date_str = root.get('fechaVersion')
+            last_modified = date.fromisoformat(version_date_str) if version_date_str else None
 
             # Type and number
-            tipo_numero = identificador.find('.//ns:TipoNumero', self.NS)
-            if tipo_numero is None:
+            type_number_elem = identificador.find('.//ns:TipoNumero', self.NS)
+            if type_number_elem is None:
                 return None
 
-            tipo_elem = tipo_numero.find('ns:Tipo', self.NS)
-            numero_elem = tipo_numero.find('ns:Numero', self.NS)
+            type_elem = type_number_elem.find('ns:Tipo', self.NS)
+            number_elem = type_number_elem.find('ns:Numero', self.NS)
 
-            if tipo_elem is None or numero_elem is None:
+            if type_elem is None or number_elem is None:
                 return None
 
-            tipo_text = tipo_elem.text.strip()
-            numero_text = numero_elem.text.strip()
+            type_text = type_elem.text.strip()
+            number_text = number_elem.text.strip()
 
-            # Map tipo to NormType
-            norm_type = self._map_tipo_to_norm_type(tipo_text)
+            # Map type to NormType
+            norm_type = self._map_tipo_to_norm_type(type_text)
 
-            # Organismo
-            organismo_elem = identificador.find('.//ns:Organismo', self.NS)
-            issuing_body = organismo_elem.text.strip() if organismo_elem is not None else "MINISTERIO"
+            # Issuing body
+            organism_elem = identificador.find('.//ns:Organismo', self.NS)
+            issuing_body = organism_elem.text.strip() if organism_elem is not None else "MINISTERIO"
 
-            # Metadatos
-            metadatos = root.find('ns:Metadatos', self.NS)
-            titulo_elem = metadatos.find('ns:TituloNorma', self.NS) if metadatos is not None else None
-            title = titulo_elem.text.strip() if titulo_elem is not None and titulo_elem.text else f"{tipo_text} {numero_text}"
+            # Metadata
+            metadata_elem = root.find('ns:Metadatos', self.NS)
+            title_elem = metadata_elem.find('ns:TituloNorma', self.NS) if metadata_elem is not None else None
+            title = title_elem.text.strip() if title_elem is not None and title_elem.text else f"{type_text} {number_text}"
 
             # Summary (must be at least 50 chars for Pydantic validation)
-            base_summary = f"{tipo_text} {numero_text}: {title}"
+            base_summary = f"{type_text} {number_text}: {title}"
 
             # Ensure minimum 50 chars
             if len(base_summary) < 50:
                 # Add publication info
-                fecha_pub_str = f"Publicado el {fecha_publicacion}" if fecha_publicacion else ""
-                base_summary = f"{base_summary}. {fecha_pub_str}"
+                pub_date_str = f"Publicado el {publication_date_str}" if publication_date_str else ""
+                base_summary = f"{base_summary}. {pub_date_str}"
 
-                # If still too short, add organismo
+                # If still too short, add issuing body
                 if len(base_summary) < 50:
                     base_summary = f"{base_summary}. Emitido por {issuing_body}"
 
@@ -139,8 +160,8 @@ class BCNXMLParser:
             return {
                 "norm_id": norm_id,
                 "norm_type": norm_type,
-                "norm_number": numero_text,
-                "title": f"{tipo_text} {numero_text}: {title}",
+                "norm_number": number_text,
+                "title": f"{type_text} {number_text}: {title}",
                 "publication_date": publication_date,
                 "promulgation_date": promulgation_date,
                 "last_modified": last_modified,
@@ -148,26 +169,26 @@ class BCNXMLParser:
                 "summary": summary,
                 "official_url": official_url,
                 "subject_tags": [],
-                "version": fecha_version,
+                "version": version_date_str,
             }
 
         except Exception as e:
             logger.error("metadata_extraction_error", error=str(e))
             return None
 
-    def _map_tipo_to_norm_type(self, tipo: str) -> NormType:
-        """Map XML tipo to NormType enum."""
-        tipo_lower = tipo.lower()
+    def _map_tipo_to_norm_type(self, type_str: str) -> NormType:
+        """Map XML type to NormType enum."""
+        type_lower = type_str.lower()
 
-        if 'ley' in tipo_lower:
+        if 'ley' in type_lower:
             return NormType.LEY
-        elif 'codigo' in tipo_lower or 'código' in tipo_lower:
+        elif 'codigo' in type_lower or 'código' in type_lower:
             return NormType.CODIGO
-        elif 'dfl' in tipo_lower:
+        elif 'dfl' in type_lower:
             return NormType.DFL
-        elif 'decreto' in tipo_lower:
+        elif 'decreto' in type_lower:
             return NormType.DECRETO
-        elif 'reglamento' in tipo_lower:
+        elif 'reglamento' in type_lower:
             return NormType.REGLAMENTO
         else:
             return NormType.LEY
@@ -177,19 +198,24 @@ class BCNXMLParser:
         Extract full text content from XML.
 
         Concatenates all text from all parts.
+        Skips binary attachments (images).
         """
         content_parts = []
 
-        # Encabezado
-        encabezado = root.find('ns:Encabezado/ns:Texto', self.NS)
-        if encabezado is not None and encabezado.text:
-            content_parts.append(encabezado.text.strip())
+        # Header
+        header = root.find('ns:Encabezado/ns:Texto', self.NS)
+        if header is not None:
+            text = self._extract_text_without_binaries(header)
+            if text:
+                content_parts.append(text)
 
-        # All EstructuraFuncional texts
-        for estructura in root.findall('.//ns:EstructuraFuncional', self.NS):
-            texto_elem = estructura.find('ns:Texto', self.NS)
-            if texto_elem is not None and texto_elem.text:
-                content_parts.append(texto_elem.text.strip())
+        # All functional structure texts
+        for structure in root.findall('.//ns:EstructuraFuncional', self.NS):
+            text_elem = structure.find('ns:Texto', self.NS)
+            if text_elem is not None:
+                text = self._extract_text_without_binaries(text_elem)
+                if text:
+                    content_parts.append(text)
 
         return '\n\n'.join(content_parts)
 
@@ -210,14 +236,14 @@ class BCNXMLParser:
             hierarchy = {}
 
             # Find all articles
-            for estructura in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
-                id_parte = estructura.get('idParte')
+            for structure in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
+                id_parte = structure.get('idParte')
                 if not id_parte:
                     continue
 
                 # Get article name
-                nombre_elem = estructura.find('.//ns:NombreParte', self.NS)
-                article_label = nombre_elem.text.strip() if nombre_elem is not None and nombre_elem.text else None
+                name_elem = structure.find('.//ns:NombreParte', self.NS)
+                article_label = name_elem.text.strip() if name_elem is not None and name_elem.text else None
 
                 if not article_label:
                     continue
@@ -237,14 +263,14 @@ class BCNXMLParser:
                         parent_article = int(match.group(1))
 
                 # Get hierarchy level (count parent elements)
-                hierarchy_level = self._get_hierarchy_level(estructura, root)
+                hierarchy_level = self._get_hierarchy_level(structure, root)
 
-                # Vigencia (derogado attribute) - GRATIS!
-                derogado = estructura.get('derogado', 'no derogado')
-                vigente = derogado == 'no derogado'
+                # Validity status (repealed attribute from XML)
+                repealed_attr = structure.get('derogado', 'no derogado')
+                in_force = repealed_attr == 'no derogado'
 
-                # Fecha version
-                fecha_version = estructura.get('fechaVersion')
+                # Version date
+                version_date_str = structure.get('fechaVersion')
 
                 hierarchy[id_parte] = {
                     'article_number': article_number,
@@ -252,8 +278,8 @@ class BCNXMLParser:
                     'is_nested': is_nested,
                     'parent_article': parent_article,
                     'hierarchy_level': hierarchy_level,
-                    'vigente': vigente,  # ✅ Vigencia gratis!
-                    'fecha_version': fecha_version,
+                    'in_force': in_force,
+                    'version_date': version_date_str,
                 }
 
             logger.info(
@@ -309,6 +335,48 @@ class BCNXMLParser:
                 return parent
         return None
 
+    def _extract_text_without_binaries(self, element: ET.Element) -> str:
+        """
+        Extract all text from element, skipping binary attachments (images).
+
+        BCN includes inline `<aem:ArchivoBinario>` elements with base64 images.
+        These must be skipped to avoid:
+        1. Corrupting text extraction
+        2. Cutting off text that comes after images
+
+        Uses itertext() to get all text nodes, filtering out binary elements.
+        """
+        text_parts = []
+
+        # Get element's direct text (before any children)
+        if element.text:
+            text_parts.append(element.text)
+
+        # Iterate through all children
+        for child in element:
+            # Skip binary attachments (images)
+            # Check tag with or without namespace
+            tag = child.tag
+            if 'ArchivoBinario' in tag:
+                # Skip this element entirely (it's a binary image)
+                # But get the tail text (text after this element)
+                if child.tail:
+                    text_parts.append(child.tail)
+                continue
+
+            # For other children, recurse
+            child_text = self._extract_text_without_binaries(child)
+            if child_text:
+                text_parts.append(child_text)
+
+            # Get tail text (text after this child element)
+            if child.tail:
+                text_parts.append(child.tail)
+
+        # Join and clean up
+        full_text = ''.join(text_parts).strip()
+        return full_text
+
     def extract_article_texts(self, xml_content: str) -> Dict[str, str]:
         """
         Extract article texts from XML.
@@ -316,20 +384,25 @@ class BCNXMLParser:
         Returns dict mapping idParte -> article text.
 
         This is what the chunker will use.
+
+        IMPORTANT: Removes binary attachments (images) that BCN includes inline.
         """
         try:
             root = ET.fromstring(xml_content)
             article_texts = {}
 
-            for estructura in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
-                id_parte = estructura.get('idParte')
+            for structure in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
+                id_parte = structure.get('idParte')
                 if not id_parte:
                     continue
 
-                # Get text
-                texto_elem = estructura.find('ns:Texto', self.NS)
-                if texto_elem is not None and texto_elem.text:
-                    article_texts[id_parte] = texto_elem.text.strip()
+                # Get text element
+                text_elem = structure.find('ns:Texto', self.NS)
+                if text_elem is not None:
+                    # Extract all text, skipping binary attachments
+                    text = self._extract_text_without_binaries(text_elem)
+                    if text:
+                        article_texts[id_parte] = text
 
             logger.debug(
                 "article_texts_extracted",
@@ -341,3 +414,116 @@ class BCNXMLParser:
         except Exception as e:
             logger.error("article_texts_extraction_failed", error=str(e))
             return {}
+
+    def extract_structural_context(self, xml_content: str, norm_id: int) -> Dict[str, Dict]:
+        """
+        Extract structural context (Book, Title, Section/Paragraph) for each article.
+
+        Returns dict mapping idParte -> structural context with full names.
+
+        Structure:
+        {
+            "article_id_parte": {
+                "book": "LIBRO SEGUNDO",
+                "book_name": "CRIMENES Y SIMPLES DELITOS Y SUS PENAS",
+                "title_ordinal": "TITULO OCTAVO",
+                "title_name": "CRIMENES Y SIMPLES DELITOS CONTRA LAS PERSONAS",
+                "section": "§1 bis",
+                "section_name": "Del femicidio"
+            }
+        }
+
+        This is CRITICAL for hybrid search:
+        - BM25 needs the structural names in text
+        - Reranker needs them visible (not just metadata)
+        - "femicidio", "malversacion", "bigamia" exist ONLY in section names
+        """
+        try:
+            root = ET.fromstring(xml_content)
+            context_map = {}
+
+            # Find all articles and walk up to get their structural context
+            for article in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
+                id_parte = article.get('idParte')
+                if not id_parte:
+                    continue
+
+                # Walk up the tree to find structural ancestors
+                context = self._find_structural_ancestors(article, root)
+                if context:
+                    context_map[id_parte] = context
+
+            logger.info(
+                "structural_context_extracted",
+                norm_id=norm_id,
+                total_articles=len(context_map)
+            )
+
+            return context_map
+
+        except Exception as e:
+            logger.error("structural_context_extraction_failed", norm_id=norm_id, error=str(e))
+            return {}
+
+    def _find_structural_ancestors(self, element: ET.Element, root: ET.Element) -> Dict:
+        """
+        Walk up the XML tree to find Libro, Titulo, Parrafo ancestors.
+
+        Reads <TituloParte> (not <NombreParte>, which is empty for structural elements).
+        """
+        context = {}
+        current = element
+
+        # Walk up the tree
+        while True:
+            parent = self._find_parent(current, root)
+            if parent is None:
+                break
+
+            type_val = parent.get('tipoParte')
+            if type_val in ['Libro', 'Título', 'Párrafo']:
+                # Read <TituloParte> from Metadata (this is where BCN stores the full name)
+                title_elem = parent.find('.//ns:TituloParte', self.NS)
+                if title_elem is not None and title_elem.text:
+                    full_text = title_elem.text.strip()
+
+                    # Parse the full text to separate ordinal from name
+                    # Examples:
+                    # "LIBRO SEGUNDO CRIMENES Y SIMPLES DELITOS Y SUS PENAS"
+                    # "TITULO OCTAVO CRIMENES Y SIMPLES DELITOS CONTRA LAS PERSONAS"
+                    # "§1 bis. Del femicidio"
+
+                    if type_val == 'Libro':
+                        # Extract "LIBRO SEGUNDO" and "CRIMENES..."
+                        parts = full_text.split(maxsplit=2)  # ["LIBRO", "SEGUNDO", "rest"]
+                        if len(parts) >= 2:
+                            ordinal = f"{parts[0]} {parts[1]}"
+                            name = parts[2] if len(parts) > 2 else ""
+                            context['book'] = ordinal
+                            context['book_name'] = name
+
+                    elif type_val == 'Título':
+                        # Extract "TITULO OCTAVO" and "CRIMENES..."
+                        parts = full_text.split(maxsplit=2)
+                        if len(parts) >= 2:
+                            ordinal = f"{parts[0]} {parts[1]}"
+                            name = parts[2] if len(parts) > 2 else ""
+                            context['title_ordinal'] = ordinal
+                            context['title_name'] = name
+
+                    elif type_val == 'Párrafo':
+                        # Extract "§1 bis" and "Del femicidio"
+                        # Pattern: "§N" or "§N bis/ter" followed by ". Name"
+                        import re
+                        match = re.match(r'^(§\s*\d+(?:\s+[a-z]+)?)\.\s*(.*)$', full_text, re.IGNORECASE)
+                        if match:
+                            context['section'] = match.group(1).strip()
+                            context['section_name'] = match.group(2).strip()
+                        else:
+                            # Fallback: treat entire text as section
+                            context['section'] = full_text
+                            context['section_name'] = ""
+
+            current = parent
+
+        return context

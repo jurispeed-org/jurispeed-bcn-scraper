@@ -1,19 +1,19 @@
 """
 Professional indexer orchestrator.
 
-Coordinates the complete indexing pipeline:
-1. Chunking (semantic)
-2. Embeddings (Bedrock Cohere v4)
-3. OpenSearch indexing
-4. S3 storage
+Reads pre-chunked documents from S3 and indexes them to OpenSearch.
 
-100% professional code, zero Lexintel dependencies.
+Pipeline:
+1. Read JSON from S3 (chunks already processed during scraping)
+2. Generate embeddings (Bedrock Cohere v4)
+3. Bulk index to OpenSearch
+
+NO re-chunking: chunks are created during scraping with XML metadata.
 """
 
+import json
 import structlog
-from typing import Dict, List
-from core.models import ChileanLegalNorm
-from pipeline.chunker import ProfessionalChunker
+from typing import Dict, List, Optional
 from pipeline.embedder import BedrockEmbedder
 from storage.opensearch_client import OpenSearchIndexer
 from storage.s3_client import S3Storage
@@ -22,30 +22,23 @@ from utils.config import Config
 logger = structlog.get_logger()
 
 
-class ProfessionalIndexer:
+class ProductionIndexer:
     """
-    Professional end-to-end indexer.
+    Production indexer that reads pre-chunked documents from S3.
 
-    Orchestrates:
-    - Semantic chunking
-    - Embedding generation
-    - OpenSearch bulk indexing
-    - S3 document storage
+    Key design:
+    - Chunks are created during scraping (with XML metadata)
+    - Indexer only generates embeddings and indexes to OpenSearch
+    - No re-chunking happens here
 
-    Zero bad practices, zero legacy code.
+    This ensures test and production use same chunking logic.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, s3_bucket: str):
         self.config = config
+        self.s3_bucket = s3_bucket
 
-        # Initialize all components
-        self.chunker = ProfessionalChunker(
-            target_chunk_size=512,  # optimal for Cohere v4
-            max_chunk_size=1000,
-            overlap_tokens=50,
-            min_chunk_size=100,
-        )
-
+        # Initialize embedder
         self.embedder = BedrockEmbedder(
             region=config.aws.region,
             model_id="cohere.embed-v4:0",
@@ -53,8 +46,12 @@ class ProfessionalIndexer:
             input_type="search_document",
         )
 
-        # Get OpenSearch host from config
-        opensearch_host = self._extract_host(config.lexintel.opensearch_index)
+        # Initialize OpenSearch
+        # Get host from env var OPENSEARCH_HOST
+        import os
+        opensearch_host = os.getenv("OPENSEARCH_HOST")
+        if not opensearch_host:
+            raise ValueError("OPENSEARCH_HOST environment variable required")
 
         self.opensearch = OpenSearchIndexer(
             host=opensearch_host,
@@ -64,223 +61,261 @@ class ProfessionalIndexer:
             aws_secret_access_key=config.aws.secret_access_key,
         )
 
-        # S3 uses dev-lexintel-bcn-cache (existing bucket)
+        # Initialize S3 client for reading documents
         self.s3 = S3Storage(
-            bucket_name="dev-lexintel-bcn-cache",
+            bucket_name=s3_bucket,
             region=config.aws.region,
             aws_access_key_id=config.aws.access_key_id,
             aws_secret_access_key=config.aws.secret_access_key,
         )
 
         self.stats = {
-            "processed": 0,
-            "chunks_created": 0,
-            "vectors_generated": 0,
+            "docs_processed": 0,
+            "chunks_indexed": 0,
+            "embeddings_generated": 0,
             "opensearch_indexed": 0,
-            "s3_stored": 0,
             "failed": 0,
         }
 
-        logger.info("indexer_initialized", knowledge_id=config.lexintel.knowledge_id)
+        logger.info(
+            "indexer_initialized",
+            s3_bucket=s3_bucket,
+            opensearch_host=opensearch_host,
+            knowledge_id=config.lexintel.knowledge_id
+        )
 
-    def _extract_host(self, index_config: str) -> str:
-        """Extract OpenSearch host from config string."""
-        # TODO: Get from env var or config
-        # For now, use the known host
-        return "search-lexintel-rag-general-v2-56kxp7ya6kxoyxaiamdujv2m5u.us-east-1.es.amazonaws.com"
-
-    def index_norm(self, norm: ChileanLegalNorm) -> Dict:
+    def index_document_from_s3(self, s3_key: str) -> Dict:
         """
-        Index one legal norm through complete pipeline.
+        Index one document from S3.
 
-        Steps:
-        1. Chunk content (semantic)
-        2. Generate embeddings (batch)
-        3. Index to OpenSearch (bulk)
-        4. Store original in S3
+        Reads pre-chunked JSON from S3, generates embeddings, indexes to OpenSearch.
 
         Args:
-            norm: Validated legal norm
+            s3_key: S3 key of document (e.g., "normativabcn/originals/bcn-242302.json")
 
         Returns:
             Result dict with statistics
         """
-        logger.info("indexing_norm", norm_id=norm.norm_id, title=norm.title[:50])
-
         try:
-            # Step 1: Chunk content
-            chunks = self.chunker.chunk(
-                text=norm.full_content,
-                metadata={
-                    "norm_id": norm.norm_id,
-                    "titulo": norm.title,
-                    "tipo_norma": norm.norm_type.value,
-                },
-            )
+            # Read document from S3
+            json_content = self.s3.get_object(s3_key)
+            doc_data = json.loads(json_content)
 
-            self.stats["chunks_created"] += len(chunks)
+            norm_id = doc_data["norm_id"]
+            chunks = doc_data.get("chunks", [])
+
+            if not chunks:
+                logger.warning("no_chunks_in_document", s3_key=s3_key, norm_id=norm_id)
+                self.stats["failed"] += 1
+                return {
+                    "success": False,
+                    "norm_id": norm_id,
+                    "error": "No chunks in document",
+                }
 
             logger.info(
-                "chunking_complete",
-                norm_id=norm.norm_id,
-                chunks=len(chunks),
-                avg_tokens=sum(c.token_count for c in chunks) / len(chunks),
+                "indexing_document",
+                norm_id=norm_id,
+                s3_key=s3_key,
+                total_chunks=len(chunks),
             )
 
-            # Step 2: Generate embeddings for all chunks
-            chunk_texts = [c.text for c in chunks]
-            chunk_vectors = self.embedder.embed_batch_with_chunking(chunk_texts, batch_size=96)
+            # Extract chunk texts for embedding
+            chunk_texts = [chunk["content"] for chunk in chunks]
 
-            self.stats["vectors_generated"] += len(chunk_vectors)
+            # Generate embeddings in batch
+            chunk_vectors = self.embedder.embed_batch_with_chunking(
+                chunk_texts,
+                batch_size=96
+            )
 
-            logger.info("embeddings_generated", norm_id=norm.norm_id, vectors=len(chunk_vectors))
+            self.stats["embeddings_generated"] += len(chunk_vectors)
 
-            # Step 2.5: Generate embedding for summary (chunk 0 special case)
-            summary_vector = self.embedder.embed_one(norm.summary)
+            logger.info(
+                "embeddings_generated",
+                norm_id=norm_id,
+                vectors=len(chunk_vectors),
+            )
 
-            # Step 3: Prepare OpenSearch documents
+            # Prepare OpenSearch documents
             opensearch_docs = []
 
             for i, (chunk, vector) in enumerate(zip(chunks, chunk_vectors)):
-                doc_id = f"bcn-{norm.norm_id}-chunk-{i}"
+                doc_id = f"bcn-{norm_id}-chunk-{i}"
 
-                # Convert norm to Lexintel format (Spanish field names)
-                norm_data = norm.to_lexintel_format()
-
-                # Add summary vector only to first chunk
-                if i == 0:
-                    norm_data["resumen_vector"] = summary_vector
-
-                document = self.opensearch.create_norm_document(
-                    doc_id=doc_id,
-                    knowledge_id=self.config.lexintel.knowledge_id,
-                    norm_data=norm_data,
-                    chunk_text=chunk.text,
-                    chunk_vector=vector,
-                    chunk_index=i,
-                    chunk_total=len(chunks),
-                )
+                # Build OpenSearch document with all metadata
+                document = {
+                    "doc_id": doc_id,
+                    "knowledge_id": self.config.lexintel.knowledge_id,
+                    "norm_id": norm_id,
+                    "norm_type": doc_data.get("norm_type"),
+                    "norm_number": doc_data.get("norm_number"),
+                    "formal_citation": doc_data.get("formal_citation"),
+                    "title": doc_data.get("title"),
+                    "publication_date": doc_data.get("publication_date"),
+                    "official_url": doc_data.get("official_url"),
+                    "summary": doc_data.get("summary"),
+                    "issuing_body": doc_data.get("issuing_body"),
+                    "subject_tags": doc_data.get("subject_tags", []),
+                    "source": doc_data.get("source", "xml"),
+                    # Chunk-specific data
+                    "chunk_index": chunk.get("chunk_index", i),
+                    "chunk_total": len(chunks),
+                    "article_number": chunk.get("article_number"),
+                    "vigente": chunk.get("vigente"),
+                    "token_count": chunk.get("token_count"),
+                    "content": chunk["content"],
+                    "chunk_metadata": chunk.get("metadata", {}),
+                    # Embedding vector
+                    "content_vector": vector,
+                }
 
                 opensearch_docs.append({"id": doc_id, "body": document})
 
             # Bulk index to OpenSearch
             bulk_result = self.opensearch.bulk_index(opensearch_docs)
             self.stats["opensearch_indexed"] += bulk_result["success"]
+            self.stats["chunks_indexed"] += bulk_result["success"]
+
+            if bulk_result["failed"] > 0:
+                logger.warning(
+                    "partial_indexing_failure",
+                    norm_id=norm_id,
+                    success=bulk_result["success"],
+                    failed=bulk_result["failed"],
+                )
+
+            self.stats["docs_processed"] += 1
 
             logger.info(
-                "opensearch_indexed",
-                norm_id=norm.norm_id,
-                success=bulk_result["success"],
-                failed=bulk_result["failed"],
-            )
-
-            # Step 4: Store original document in S3
-            s3_key = self.s3.build_key(
-                knowledge_id=self.config.lexintel.knowledge_id,
-                doc_id=f"bcn-{norm.norm_id}",
-                prefix="originals",
-            )
-
-            s3_data = {
-                "norm_id": norm.norm_id,
-                "scraped_at": norm.to_lexintel_format(),
-                "chunks": len(chunks),
-            }
-
-            s3_success = self.s3.store_document(
-                key=s3_key,
-                data=s3_data,
-                metadata={
-                    "tipo_norma": norm.norm_type.value,
-                    "numero_norma": norm.norm_number,
-                },
-            )
-
-            if s3_success:
-                self.stats["s3_stored"] += 1
-
-            # Success
-            self.stats["processed"] += 1
-
-            logger.info(
-                "norm_indexed_complete",
-                norm_id=norm.norm_id,
+                "document_indexed_complete",
+                norm_id=norm_id,
                 chunks=len(chunks),
                 opensearch_success=bulk_result["success"],
-                s3_stored=s3_success,
+                opensearch_failed=bulk_result["failed"],
             )
 
             return {
                 "success": True,
-                "norm_id": norm.norm_id,
+                "norm_id": norm_id,
                 "chunks": len(chunks),
                 "opensearch_indexed": bulk_result["success"],
-                "s3_stored": s3_success,
+            }
+
+        except json.JSONDecodeError as e:
+            self.stats["failed"] += 1
+            logger.error(
+                "json_parse_failed",
+                s3_key=s3_key,
+                error=str(e),
+            )
+            return {
+                "success": False,
+                "s3_key": s3_key,
+                "error": f"JSON parse error: {str(e)}",
             }
 
         except Exception as e:
             self.stats["failed"] += 1
             logger.error(
                 "indexing_failed",
-                norm_id=norm.norm_id,
+                s3_key=s3_key,
                 error=str(e),
                 error_type=type(e).__name__,
             )
             return {
                 "success": False,
-                "norm_id": norm.norm_id,
+                "s3_key": s3_key,
                 "error": str(e),
             }
 
-    def index_batch(self, norms: List[ChileanLegalNorm]) -> Dict[str, int]:
+    def list_documents_from_s3(self, prefix: str = None) -> List[str]:
         """
-        Index multiple norms.
+        List all documents in S3 ready for indexing.
 
         Args:
-            norms: List of validated norms
+            prefix: S3 prefix to list (default: {knowledge_id}/originals/)
 
         Returns:
-            Statistics: {"success": N, "failed": M}
+            List of S3 keys
         """
+        if prefix is None:
+            prefix = f"{self.config.lexintel.knowledge_id}/originals/"
+
+        logger.info("listing_s3_documents", prefix=prefix)
+
+        keys = self.s3.list_objects(prefix)
+
+        logger.info("s3_documents_found", total=len(keys), prefix=prefix)
+
+        return keys
+
+    def index_batch_from_s3(
+        self,
+        s3_keys: Optional[List[str]] = None,
+        prefix: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """
+        Index multiple documents from S3.
+
+        Args:
+            s3_keys: Specific list of S3 keys to index
+            prefix: S3 prefix to list and index all documents (if s3_keys not provided)
+            limit: Max number of documents to process (optional)
+
+        Returns:
+            Statistics: {"success": N, "failed": M, "total": T}
+        """
+        # Get list of documents to index
+        if s3_keys is None:
+            s3_keys = self.list_documents_from_s3(prefix)
+
+        # Apply limit if specified
+        if limit:
+            s3_keys = s3_keys[:limit]
+
+        total = len(s3_keys)
         success = 0
         failed = 0
 
-        logger.info("batch_indexing_start", total=len(norms))
+        logger.info("batch_indexing_start", total=total)
 
-        for i, norm in enumerate(norms, 1):
-            result = self.index_norm(norm)
+        for i, s3_key in enumerate(s3_keys, 1):
+            result = self.index_document_from_s3(s3_key)
 
             if result["success"]:
                 success += 1
             else:
                 failed += 1
 
-            # Log progress every 10 norms
+            # Log progress every 10 documents
             if i % 10 == 0:
                 logger.info(
                     "batch_progress",
                     processed=i,
-                    total=len(norms),
+                    total=total,
+                    success=success,
+                    failed=failed,
                     success_rate=f"{(success / i) * 100:.1f}%",
                 )
 
         logger.info(
             "batch_indexing_complete",
-            total=len(norms),
+            total=total,
             success=success,
             failed=failed,
+            success_rate=f"{(success / total) * 100:.1f}%" if total > 0 else "0%",
         )
 
-        return {"success": success, "failed": failed}
+        return {"success": success, "failed": failed, "total": total}
 
     def get_stats(self) -> Dict:
         """Get comprehensive statistics."""
         return {
             **self.stats,
-            "chunker": {"name": "ProfessionalChunker"},
             "embedder": self.embedder.get_stats(),
             "opensearch": self.opensearch.get_stats(),
-            "s3": self.s3.get_stats(),
         }
 
     def close(self):

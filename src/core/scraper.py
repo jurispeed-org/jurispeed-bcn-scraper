@@ -133,7 +133,7 @@ class BCNPlaywrightScraper:
         Returns:
             XML content or None if failed
         """
-        url = f"http://www.leychile.cl/Consulta/obtxml?opt=7&idNorma={norm_id}"
+        url = f"http://www.leychile.cl/Consulta/obtxml?opt=7&idNorma={norm_id}&notaPIE=1"
         effective_timeout = timeout or self.config.timeout_seconds
 
         headers = {

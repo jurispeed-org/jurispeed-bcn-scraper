@@ -22,6 +22,7 @@ class NormStatus(str, Enum):
     PENDING = "pending"
     SUCCESS = "success"
     FAILED = "failed"
+    REFUNDIDA = "refundida"  # Norm replaced by texto refundido
 
 
 class NormTracker:
@@ -30,12 +31,15 @@ class NormTracker:
 
     Table schema:
     - norm_id (number, partition key)
-    - status (string): pending|success|failed
+    - status (string): pending|success|failed|refundida
     - attempts (number): retry attempts count
     - source (string): xml|html
     - failure_reason (string): error message if failed
+    - refundido_por (number): idNorma of the texto refundido that replaces this (only for refundida status)
+    - reason (string): explanation for refundida status
     - last_attempt_at (string): ISO timestamp
     - success_at (string): ISO timestamp
+    - updated_at (string): ISO timestamp
     - total_chunks (number)
     - total_articles (number)
     """
@@ -166,6 +170,53 @@ class NormTracker:
                 error=e.response["Error"]["Message"]
             )
 
+    def mark_refundida(self, refundido_por: int, refundida_law_number: str, reason: str):
+        """
+        Mark that a texto refundido was detected, storing the original law number.
+
+        Note: We DON'T know the norm_id of the original yet (only the law number).
+        The cleanup script will resolve law_number -> norm_id via BCN API.
+
+        Args:
+            refundido_por: ID of the DFL/texto refundido (the one we just scraped)
+            refundida_law_number: Law number of the original (e.g., "18290", "20000")
+            reason: Explanation (e.g., "Detected: TEXTO REFUNDIDO en DFL 1/2007")
+        """
+        try:
+            now = datetime.utcnow().isoformat()
+
+            # Store as special entry with refundido_por as key
+            # We'll use a prefix to distinguish from regular norms
+            # Key format: "refundicion_{refundido_por}"
+            special_key = f"refundicion_{refundido_por}"
+
+            self.table.put_item(
+                Item={
+                    "norm_id": 999999999,  # Placeholder (GSI will use status)
+                    "status": NormStatus.REFUNDIDA.value,
+                    "refundido_por": refundido_por,
+                    "refundida_law_number": refundida_law_number,
+                    "reason": reason,
+                    "detected_at": now,
+                    "special_key": special_key  # For easier identification
+                }
+            )
+
+            logger.info(
+                "refundicion_detected_stored",
+                refundido_por=refundido_por,
+                refundida_law_number=refundida_law_number,
+                reason=reason[:100]
+            )
+
+        except ClientError as e:
+            logger.error(
+                "mark_refundida_failed",
+                refundido_por=refundido_por,
+                refundida_law_number=refundida_law_number,
+                error=e.response["Error"]["Message"]
+            )
+
     def get_failed(self, max_attempts: int = 5) -> List[Dict]:
         """
         Get list of failed norms that can be retried.
@@ -235,6 +286,84 @@ class NormTracker:
             )
             return []
 
+    def get_all_by_status(self, status: NormStatus) -> List[Dict]:
+        """
+        Get all norms with specific status.
+
+        Uses GSI status-index for efficient query (if available).
+        Falls back to scan if GSI doesn't exist.
+
+        Args:
+            status: NormStatus enum value
+
+        Returns:
+            List of norm items with full attributes
+        """
+        try:
+            # Try using GSI first (more efficient)
+            try:
+                response = self.table.query(
+                    IndexName="status-index",
+                    KeyConditionExpression="status = :status",
+                    ExpressionAttributeValues={
+                        ":status": status.value
+                    }
+                )
+
+                items = response.get("Items", [])
+
+                # Handle pagination
+                while "LastEvaluatedKey" in response:
+                    response = self.table.query(
+                        IndexName="status-index",
+                        KeyConditionExpression="status = :status",
+                        ExpressionAttributeValues={":status": status.value},
+                        ExclusiveStartKey=response["LastEvaluatedKey"]
+                    )
+                    items.extend(response.get("Items", []))
+
+                logger.info("queried_by_status_gsi",
+                           status=status.value,
+                           count=len(items))
+                return items
+
+            except ClientError as gsi_error:
+                # GSI doesn't exist, fall back to scan
+                if "ResourceNotFoundException" in str(gsi_error):
+                    logger.warning("status_gsi_not_found_falling_back_to_scan",
+                                  status=status.value)
+
+                    response = self.table.scan(
+                        FilterExpression="#status = :status",
+                        ExpressionAttributeNames={"#status": "status"},
+                        ExpressionAttributeValues={":status": status.value}
+                    )
+
+                    items = response.get("Items", [])
+
+                    # Handle pagination for scan
+                    while "LastEvaluatedKey" in response:
+                        response = self.table.scan(
+                            FilterExpression="#status = :status",
+                            ExpressionAttributeNames={"#status": "status"},
+                            ExpressionAttributeValues={":status": status.value},
+                            ExclusiveStartKey=response["LastEvaluatedKey"]
+                        )
+                        items.extend(response.get("Items", []))
+
+                    logger.info("scanned_by_status",
+                               status=status.value,
+                               count=len(items))
+                    return items
+                else:
+                    raise
+
+        except ClientError as e:
+            logger.error("get_all_by_status_failed",
+                        status=status.value,
+                        error=e.response["Error"]["Message"])
+            return []
+
     def get_stats(self) -> Dict:
         """
         Get aggregate statistics.
@@ -250,7 +379,8 @@ class NormTracker:
             status_counts = {
                 NormStatus.PENDING.value: 0,
                 NormStatus.SUCCESS.value: 0,
-                NormStatus.FAILED.value: 0
+                NormStatus.FAILED.value: 0,
+                NormStatus.REFUNDIDA.value: 0
             }
 
             total_chunks = 0
@@ -289,6 +419,7 @@ class NormTracker:
                 "pending": status_counts[NormStatus.PENDING.value],
                 "success": success,
                 "failed": status_counts[NormStatus.FAILED.value],
+                "refundida": status_counts[NormStatus.REFUNDIDA.value],
                 "success_rate": f"{(success / total * 100):.1f}%" if total > 0 else "0%",
                 "total_chunks": total_chunks,
                 "total_articles": total_articles,
