@@ -161,11 +161,9 @@ class ProductionIndexer:
                     # Chunk-specific data
                     "chunk_index": chunk.get("chunk_index", i),
                     "chunk_total": len(chunks),
-                    "article_number": chunk.get("article_number"),
-                    "vigente": chunk.get("vigente"),
                     "token_count": chunk.get("token_count"),
                     "content": chunk["content"],
-                    "chunk_metadata": chunk.get("metadata", {}),
+                    "chunk_metadata": chunk.get("metadata", {}),  # Contains article_label (string) instead of article_number (int)
                     # Embedding vector
                     "content_vector": vector,
                 }

@@ -6,7 +6,7 @@ Schema: EsquemaIntercambioNorma-v1-0.xsd
 """
 
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import date
 import structlog
 from core.models import ChileanLegalNorm, NormType
@@ -136,10 +136,14 @@ class BCNXMLParser:
             # Metadata
             metadata_elem = root.find('ns:Metadatos', self.NS)
             title_elem = metadata_elem.find('ns:TituloNorma', self.NS) if metadata_elem is not None else None
-            title = title_elem.text.strip() if title_elem is not None and title_elem.text else f"{type_text} {number_text}"
+            title_raw = title_elem.text.strip() if title_elem is not None and title_elem.text else f"{type_text} {number_text}"
+
+            # Clean duplicated titles (Hallazgo #7)
+            # Example: if type_text="Código" and title_raw="CÓDIGO PENAL", avoid "Código 1984: CÓDIGO PENAL"
+            title_clean = self._clean_duplicate_title(type_text, number_text, title_raw)
 
             # Summary (must be at least 50 chars for Pydantic validation)
-            base_summary = f"{type_text} {number_text}: {title}"
+            base_summary = f"{type_text} {number_text}: {title_clean}"
 
             # Ensure minimum 50 chars
             if len(base_summary) < 50:
@@ -161,7 +165,7 @@ class BCNXMLParser:
                 "norm_id": norm_id,
                 "norm_type": norm_type,
                 "norm_number": number_text,
-                "title": f"{type_text} {number_text}: {title}",
+                "title": f"{type_text} {number_text}: {title_clean}",
                 "publication_date": publication_date,
                 "promulgation_date": promulgation_date,
                 "last_modified": last_modified,
@@ -177,21 +181,134 @@ class BCNXMLParser:
             return None
 
     def _map_tipo_to_norm_type(self, type_str: str) -> NormType:
-        """Map XML type to NormType enum."""
-        type_lower = type_str.lower()
+        """
+        Map XML type to NormType enum.
 
-        if 'ley' in type_lower:
-            return NormType.LEY
-        elif 'codigo' in type_lower or 'código' in type_lower:
-            return NormType.CODIGO
-        elif 'dfl' in type_lower:
+        BCN's <Tipo> element contains the specific norm type.
+        We map it to our expanded NormType enum.
+
+        This fixes Hallazgo #7: norm_type incorrect.
+        """
+        type_clean = type_str.strip().lower()
+
+        # Exact matches first (most specific)
+        EXACT_MAP = {
+            'codigo': NormType.CODIGO,
+            'código': NormType.CODIGO,
+            'dfl': NormType.DFL,
+            'decreto ley': NormType.DL,
+            'decreto-ley': NormType.DL,
+            'decreto con fuerza de ley': NormType.DFL,
+            'decreto supremo': NormType.DECRETO_SUPREMO,
+            'orden': NormType.ORDEN,
+            'ordenanza': NormType.ORDENANZA,
+            'ordenanza municipal': NormType.ORDENANZA_MUNICIPAL,
+            'oficio': NormType.OFICIO,
+            'resolucion': NormType.RESOLUCION,
+            'resolución': NormType.RESOLUCION,
+            'circular': NormType.CIRCULAR,
+            'instruccion': NormType.INSTRUCCION,
+            'instrucción': NormType.INSTRUCCION,
+            'reglamento': NormType.REGLAMENTO,
+            'acuerdo': NormType.ACUERDO,
+            'convenio': NormType.CONVENIO,
+            'tratado': NormType.TRATADO,
+            'auto acordado': NormType.AUTO_ACORDADO,
+        }
+
+        # Check exact matches
+        if type_clean in EXACT_MAP:
+            return EXACT_MAP[type_clean]
+
+        # Partial matches (order matters - most specific first)
+        if 'decreto ley' in type_clean or 'decreto-ley' in type_clean:
+            return NormType.DL
+        elif 'dfl' in type_clean or 'fuerza de ley' in type_clean:
             return NormType.DFL
-        elif 'decreto' in type_lower:
+        elif 'decreto supremo' in type_clean:
+            return NormType.DECRETO_SUPREMO
+        elif 'decreto' in type_clean:
             return NormType.DECRETO
-        elif 'reglamento' in type_lower:
+        elif 'codigo' in type_clean or 'código' in type_clean:
+            return NormType.CODIGO
+        elif 'ordenanza municipal' in type_clean:
+            return NormType.ORDENANZA_MUNICIPAL
+        elif 'ordenanza' in type_clean:
+            return NormType.ORDENANZA
+        elif 'orden' in type_clean:
+            return NormType.ORDEN
+        elif 'oficio' in type_clean:
+            return NormType.OFICIO
+        elif 'resolucion' in type_clean or 'resolución' in type_clean:
+            return NormType.RESOLUCION
+        elif 'circular' in type_clean:
+            return NormType.CIRCULAR
+        elif 'instruccion' in type_clean or 'instrucción' in type_clean:
+            return NormType.INSTRUCCION
+        elif 'reglamento' in type_clean:
             return NormType.REGLAMENTO
-        else:
+        elif 'acuerdo' in type_clean:
+            return NormType.ACUERDO
+        elif 'convenio' in type_clean:
+            return NormType.CONVENIO
+        elif 'tratado' in type_clean:
+            return NormType.TRATADO
+        elif 'auto acordado' in type_clean:
+            return NormType.AUTO_ACORDADO
+        elif 'ley' in type_clean:
             return NormType.LEY
+        else:
+            # Default fallback
+            logger.warning("unknown_norm_type", type_str=type_str)
+            return NormType.LEY
+
+    def _clean_duplicate_title(self, type_text: str, number_text: str, title_raw: str) -> str:
+        """
+        Clean duplicate titles (Hallazgo #7).
+
+        Examples of problems:
+        - "Código PENAL: CÓDIGO PENAL" → should be "Código Penal"
+        - "Orden 2870: PROTOCOLOS..." → OK (not duplicated)
+
+        Strategy:
+        1. If title starts with type_text (ignoring case), remove the duplicate
+        2. Normalize case to title case for readability
+
+        Args:
+            type_text: Type from XML (e.g., "Código", "Orden")
+            number_text: Number from XML (e.g., "1984", "2870")
+            title_raw: Raw title from XML
+
+        Returns:
+            Cleaned title
+        """
+        title_lower = title_raw.lower()
+        type_lower = type_text.lower()
+
+        # Check if title starts with the type (duplicate)
+        if title_lower.startswith(type_lower):
+            # Remove the duplicate type from title
+            # Example: "CÓDIGO PENAL" → "PENAL"
+            remaining = title_raw[len(type_text):].strip()
+
+            # Remove leading punctuation (: - etc.)
+            remaining = remaining.lstrip(':').lstrip('-').strip()
+
+            # If remaining is just the number, keep the original title
+            if remaining == number_text or not remaining:
+                return title_raw
+
+            # Use the remaining part
+            title_clean = remaining
+        else:
+            title_clean = title_raw
+
+        # Normalize case: convert all-caps to title case for readability
+        if title_clean.isupper() and len(title_clean) > 3:
+            # "CÓDIGO PENAL" → "Código Penal"
+            title_clean = title_clean.title()
+
+        return title_clean
 
     def _extract_full_content(self, root: ET.Element) -> str:
         """
@@ -230,10 +347,17 @@ class BCNXMLParser:
         - derogado is direct attribute (vigencia!)
         - hierarchy is native XML tree
         - fechaVersion per article
+
+        IMPORTANT: Detects nested structures (Hallazgo #6):
+        - Articles inside N°/romano/TÍTULO are marked as nested
+        - parent_article is set to the parent container number
         """
         try:
             root = ET.fromstring(xml_content)
             hierarchy = {}
+
+            # Build parent map for upward navigation
+            parent_map = {c: p for p in root.iter() for c in p}
 
             # Find all articles
             for structure in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
@@ -251,16 +375,27 @@ class BCNXMLParser:
                 # Extract article number
                 article_number = self._extract_article_number(article_label)
 
-                # Check if nested (has "DEL ART" in name)
-                is_nested = 'DEL ART' in article_label.upper()
+                # Check if nested in two ways:
+                # 1. Legacy: has "DEL ART" in name
+                is_nested_legacy = 'DEL ART' in article_label.upper()
                 parent_article = None
 
-                if is_nested:
-                    # Extract parent article number
+                if is_nested_legacy:
+                    # Extract parent article number from label
                     import re
                     match = re.search(r'DEL ART[^\d]*(\d+)', article_label, re.IGNORECASE)
                     if match:
                         parent_article = int(match.group(1))
+
+                # 2. NEW: Check if inside a parent structure (N°, romano, TÍTULO, etc.)
+                is_nested_structural, parent_structural = self._detect_nested_structure(
+                    structure, parent_map
+                )
+
+                # Combine both detections
+                is_nested = is_nested_legacy or is_nested_structural
+                if parent_structural is not None:
+                    parent_article = parent_structural
 
                 # Get hierarchy level (count parent elements)
                 hierarchy_level = self._get_hierarchy_level(structure, root)
@@ -333,6 +468,99 @@ class BCNXMLParser:
         for parent in root.iter():
             if element in parent:
                 return parent
+        return None
+
+    def _detect_nested_structure(
+        self,
+        article_element: ET.Element,
+        parent_map: Dict
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        Detect if an article is nested inside a parent structure (N°, romano, TÍTULO, etc.).
+
+        This fixes Hallazgo #6: Doble articulado no detectado.
+
+        Example XML structure:
+        <EstructuraFuncional tipoParte="N°" idParte="10534843">
+            <Articulo>2.</Articulo>
+            <EstructuraFuncional tipoParte="Artículo" idParte="10534844">
+                <Articulo>1º</Articulo>  <!-- This is nested! -->
+            </EstructuraFuncional>
+        </EstructuraFuncional>
+
+        Args:
+            article_element: The article element to check
+            parent_map: Dict mapping child -> parent for upward navigation
+
+        Returns:
+            (is_nested, parent_number): Tuple with:
+                - is_nested: True if article is inside a parent structure
+                - parent_number: Number of parent container (e.g., 2 for "N° 2")
+        """
+        # Parent container types that can contain nested articles
+        CONTAINER_TYPES = [
+            'N°', 'romano', 'TÍTULO', 'Título', 'Capítulo', 'Sección',
+            'Doble Articulado',  # Ordenanzas with nested article structure
+            'Párrafo'  # Some norms use Párrafo as container
+        ]
+
+        # Traverse up to find parent EstructuraFuncional
+        current = article_element
+        while current is not None:
+            parent = parent_map.get(current)
+            if parent is None:
+                break
+
+            # Check if parent is EstructuraFuncional with a container type
+            if parent.tag.endswith('EstructuraFuncional'):
+                parent_tipo = parent.get('tipoParte')
+
+                if parent_tipo in CONTAINER_TYPES:
+                    # Found a container! Extract its number
+                    parent_number = self._extract_container_number(parent)
+
+                    logger.debug(
+                        "nested_structure_detected",
+                        article_id=article_element.get('idParte'),
+                        parent_tipo=parent_tipo,
+                        parent_number=parent_number
+                    )
+
+                    return (True, parent_number)
+
+            current = parent
+
+        # Not nested
+        return (False, None)
+
+    def _extract_container_number(self, container_element: ET.Element) -> Optional[int]:
+        """
+        Extract number from a container element (N°, romano, etc.).
+
+        Examples:
+        - <Articulo>2.</Articulo> → 2
+        - <Articulo>N° 2</Articulo> → 2
+        - <Articulo>II</Articulo> → 2 (romano)
+        """
+        import re
+
+        # Get the <Articulo> or <NombreParte> element
+        name_elem = container_element.find('.//ns:Articulo', self.NS)
+        if name_elem is None:
+            name_elem = container_element.find('.//ns:NombreParte', self.NS)
+
+        if name_elem is not None and name_elem.text:
+            text = name_elem.text.strip()
+
+            # Try to extract number
+            # Pattern: "2", "2.", "N° 2", "Nº 2"
+            match = re.search(r'(\d+)', text)
+            if match:
+                return int(match.group(1))
+
+            # TODO: Handle roman numerals (II, III, IV, etc.)
+            # For now, return None for roman numerals
+
         return None
 
     def _extract_text_without_binaries(self, element: ET.Element) -> str:
@@ -527,3 +755,99 @@ class BCNXMLParser:
             current = parent
 
         return context
+
+    def extract_binary_content(self, xml_content: str, norm_id: int) -> Dict[str, dict]:
+        """
+        Detect articles with binary content (images, tables).
+
+        BCN includes <aem:ArchivoBinario> elements with base64-encoded images/tables
+        in articles that have visual content. This method detects which articles
+        have binary content so we can:
+        1. Add metadata flag
+        2. Add textual note to warn users
+        3. Mark content as incomplete
+
+        Args:
+            xml_content: Raw XML string from BCN
+            norm_id: Norm ID for logging
+
+        Returns:
+            Dict mapping part_id -> binary info:
+            {
+                "10534846": {
+                    "present": True,
+                    "type": "image",
+                    "filename": "tabla_tarifas.png",
+                    "description": "Contenido binario no indexado"
+                }
+            }
+        """
+        try:
+            root = ET.fromstring(xml_content)
+            binary_map = {}
+
+            # Build a child->parent map first (ElementTree doesn't support upward navigation)
+            parent_map = {c: p for p in root.iter() for c in p}
+
+            # Find all ArchivoBinario elements (with or without namespace)
+            # BCN uses: <aem:ArchivoBinario nombre="filename.png">base64data</aem:ArchivoBinario>
+            for archivo in root.iter():
+                if 'ArchivoBinario' in archivo.tag:
+                    # Found a binary element, now find its parent article
+                    filename = archivo.get('nombre', 'unknown')
+
+                    # Traverse up using parent_map to find element with idParte
+                    current = archivo
+                    while current is not None:
+                        parent = parent_map.get(current)
+                        if parent is None:
+                            break
+
+                        part_id = parent.get('idParte')
+                        if part_id:
+                            # Found the article containing this binary
+                            # Detect type from filename
+                            binary_type = 'image'
+                            if filename:
+                                ext = filename.lower().split('.')[-1]
+                                if ext in ['png', 'jpg', 'jpeg', 'gif', 'bmp']:
+                                    binary_type = 'image'
+                                elif ext in ['pdf']:
+                                    binary_type = 'document'
+                                else:
+                                    binary_type = 'unknown'
+
+                            binary_map[part_id] = {
+                                'present': True,
+                                'type': binary_type,
+                                'filename': filename,
+                                'description': 'Contenido binario no indexado (imagen o tabla)'
+                            }
+
+                            logger.debug(
+                                "binary_content_detected",
+                                norm_id=norm_id,
+                                part_id=part_id,
+                                filename=filename,
+                                type=binary_type
+                            )
+                            break
+
+                        current = parent
+
+            if binary_map:
+                logger.info(
+                    "binary_content_extraction_complete",
+                    norm_id=norm_id,
+                    articles_with_binary=len(binary_map)
+                )
+
+            return binary_map
+
+        except Exception as e:
+            logger.warning(
+                "binary_content_extraction_failed",
+                norm_id=norm_id,
+                error=str(e)
+            )
+            return {}

@@ -15,21 +15,39 @@ from enum import Enum
 
 class NormType(str, Enum):
     """
-    Types of legal norms in Chilean law.
+    Types of legal norms in Chilean law (28 types from BCN).
 
-    Spanish terms preserved because they have specific legal meaning:
-    - LEY: Law (legislation passed by Congress)
-    - CODIGO: Legal code (comprehensive law compilation)
-    - DFL: Decree with Force of Law (executive decree with legislative power)
-    - DECRETO: Decree (executive regulation)
-    - REGLAMENTO: Regulation (administrative rules)
+    Spanish terms preserved because they have specific legal meaning.
+    This enum covers the most common types from BCN's taxonomy.
     """
 
+    # Primary legislation
     LEY = "ley"
     CODIGO = "codigo"
-    DFL = "dfl"
+
+    # Executive decrees
+    DFL = "dfl"  # Decreto con Fuerza de Ley
+    DL = "decreto_ley"  # Decreto Ley
     DECRETO = "decreto"
+    DECRETO_SUPREMO = "decreto_supremo"
+
+    # Regulations and administrative
     REGLAMENTO = "reglamento"
+    RESOLUCION = "resolucion"
+    ORDEN = "orden"
+    ORDENANZA = "ordenanza"
+    OFICIO = "oficio"
+    CIRCULAR = "circular"
+    INSTRUCCION = "instruccion"
+
+    # Municipal
+    ORDENANZA_MUNICIPAL = "ordenanza_municipal"
+
+    # Other
+    ACUERDO = "acuerdo"
+    CONVENIO = "convenio"
+    TRATADO = "tratado"
+    AUTO_ACORDADO = "auto_acordado"
 
 
 class ChileanLegalNorm(BaseModel):
@@ -104,26 +122,99 @@ class ChileanLegalNorm(BaseModel):
         Generate formal citation for this norm.
 
         Examples:
-            - "LEY N° 824"
+            - "Ley N° 824"
             - "DFL N° 830"
-            - "CÓDIGO CIVIL"
+            - "Código Penal"
+            - "Código Civil"
 
         Returns:
             Formal citation string suitable for legal references
         """
-        # Normalize norm_type
+        norm_type_value = self.norm_type.value if hasattr(self.norm_type, 'value') else str(self.norm_type)
+
+        # Special handling for códigos with proper names
+        if norm_type_value.lower() == "codigo":
+            # Extract code name from title
+            codigo_name = self._extract_codigo_name()
+            if codigo_name:
+                return codigo_name
+
+        # Standard format for other norm types
         type_map = {
-            "ley": "LEY",
-            "codigo": "CÓDIGO",
+            "ley": "Ley",
+            "codigo": "Código",
             "dfl": "DFL",
-            "decreto": "DECRETO",
-            "reglamento": "REGLAMENTO"
+            "decreto_ley": "Decreto Ley",
+            "decreto": "Decreto",
+            "decreto_supremo": "Decreto Supremo",
+            "reglamento": "Reglamento",
+            "resolucion": "Resolución",
+            "orden": "Orden",
+            "ordenanza": "Ordenanza",
+            "ordenanza_municipal": "Ordenanza Municipal",
+            "oficio": "Oficio",
+            "circular": "Circular",
+            "instruccion": "Instrucción",
+            "acuerdo": "Acuerdo",
+            "convenio": "Convenio",
+            "tratado": "Tratado",
+            "auto_acordado": "Auto Acordado",
         }
 
-        norm_type_value = self.norm_type.value if hasattr(self.norm_type, 'value') else str(self.norm_type)
-        formal_type = type_map.get(norm_type_value.lower(), norm_type_value.upper())
+        formal_type = type_map.get(norm_type_value.lower(), norm_type_value.title())
 
         return f"{formal_type} N° {self.norm_number}"
+
+    def _extract_codigo_name(self) -> Optional[str]:
+        """
+        Extract proper name for códigos from title.
+
+        Examples:
+            "Código PENAL: CÓDIGO PENAL" -> "Código Penal"
+            "Código 1855: Codigo Civil" -> "Código Civil"
+            "Código Tributario: ..." -> "Código Tributario"
+
+        Returns:
+            Clean código name or None if not extractable
+        """
+        title = self.title.lower()
+
+        # Well-known códigos mapping
+        KNOWN_CODIGOS = {
+            'penal': 'Código Penal',
+            '1855': 'Código Civil',
+            'civil': 'Código Civil',
+            'tributario': 'Código Tributario',
+            'comercio': 'Código de Comercio',
+            'trabajo': 'Código del Trabajo',
+            'procedimiento civil': 'Código de Procedimiento Civil',
+            'procedimiento penal': 'Código Procesal Penal',
+            'mineria': 'Código de Minería',
+            'aguas': 'Código de Aguas',
+        }
+
+        # Check norm_number first (most reliable)
+        norm_num_lower = self.norm_number.lower()
+        if norm_num_lower in KNOWN_CODIGOS:
+            return KNOWN_CODIGOS[norm_num_lower]
+
+        # Check title for known patterns
+        for key, name in KNOWN_CODIGOS.items():
+            if key in title:
+                return name
+
+        # Fallback: try to extract from title after colon
+        if ':' in self.title:
+            parts = self.title.split(':', 1)
+            if len(parts) == 2:
+                # "Código PENAL: CÓDIGO PENAL" -> take the clean part
+                after_colon = parts[1].strip().title()
+                # Avoid duplicated words like "Código Código"
+                if after_colon.lower().startswith('codigo'):
+                    return after_colon
+
+        # If can't extract, return standard format
+        return None
 
     def get_article_citation(
         self,

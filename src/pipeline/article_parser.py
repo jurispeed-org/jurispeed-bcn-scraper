@@ -36,12 +36,25 @@ class ArticleSubstructureParser:
     """
 
     def __init__(self):
-        # Patterns for numerales
+        # Patterns for numerales (Hallazgo #5 fix: ampliado para detectar más formatos)
+        # ORDER MATTERS: more specific patterns first
         self.numeral_patterns = [
-            r'^\s*(\d+)\.\s+',  # "1. texto"
-            r'^\s*(\d+)\)\s+',  # "1) texto"
+            r'^\s*(\d+)\.-\s+',  # "1.- texto" (with hyphen - common in Chilean law)
+            r'^\s*(\d+)\.°\s+',  # "1.° texto" (masculine degree symbol)
+            r'^\s*(\d+)\.ª\s+',  # "1.ª texto" (feminine degree symbol)
+            r'^\s*(\d+)\.\s+',   # "1. texto" (simple dot)
+            r'^\s*(\d+)\)\s+',   # "1) texto" (parenthesis)
             r'^\s*N°\s*(\d+)[\.:\-]?\s+',  # "N°1:" or "N° 1."
             r'^\s*Nº\s*(\d+)[\.:\-]?\s+',  # "Nº1:"
+        ]
+
+        # Inline numeral patterns (for cases like "...y 3.- texto")
+        # These detect numerals NOT at line start (Hallazgo #5: Art 365 bis case)
+        self.inline_numeral_patterns = [
+            r'\s+y\s+(\d+)\.-\s+',  # "y 3.- texto" (inline after "y")
+            r'\s+y\s+(\d+)\.°\s+',  # "y 3.° texto"
+            r'\s+y\s+(\d+)\.ª\s+',  # "y 3.ª texto"
+            r',\s*y\s+(\d+)\.-\s+',  # ", y 3.- texto" (with comma)
         ]
 
         # Patterns for letras
@@ -94,13 +107,18 @@ class ArticleSubstructureParser:
         return subparts
 
     def _has_numerales_or_letras(self, text: str) -> bool:
-        """Check if text contains numeral or letra markers."""
+        """Check if text contains numeral or letra markers (both line-start and inline)."""
         lines = text.split('\n')
 
         for line in lines:
-            # Check numerales
+            # Check line-start numerales
             for pattern in self.numeral_patterns:
                 if re.match(pattern, line, re.IGNORECASE):
+                    return True
+
+            # Check inline numerales (Hallazgo #5: "y 3.-" cases)
+            for pattern in self.inline_numeral_patterns:
+                if re.search(pattern, line, re.IGNORECASE):
                     return True
 
             # Check letras
@@ -126,6 +144,15 @@ class ArticleSubstructureParser:
         """
         subparts = []
         lines = text.split('\n')
+
+        # Preprocess: expand lines with inline numerals into multiple lines
+        # This handles cases like "1.- texto y 2.- texto y 3.- texto"
+        expanded_lines = []
+        for line in lines:
+            expanded = self._expand_inline_numerals(line)
+            expanded_lines.extend(expanded)
+
+        lines = expanded_lines
 
         current_subpart = None
         current_text_lines = []
@@ -202,6 +229,7 @@ class ArticleSubstructureParser:
         Returns:
             Dict with 'number' and 'remaining_text', or None
         """
+        # First check line-start patterns
         for pattern in self.numeral_patterns:
             match = re.match(pattern, line, re.IGNORECASE)
             if match:
@@ -213,6 +241,94 @@ class ArticleSubstructureParser:
                 }
 
         return None
+
+    def _match_inline_numeral(self, line: str) -> Optional[Dict]:
+        """
+        Check if line contains an inline numeral marker (e.g., "y 3.-").
+
+        Returns:
+            Dict with 'number', 'remaining_text', and 'prefix_text', or None
+        """
+        for pattern in self.inline_numeral_patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                number = int(match.group(1))
+                # Text before the inline numeral
+                prefix_text = line[:match.start()].strip()
+                # Text after the inline numeral marker
+                remaining_text = line[match.end():].strip()
+                return {
+                    'number': number,
+                    'remaining_text': remaining_text,
+                    'prefix_text': prefix_text
+                }
+
+        return None
+
+    def _expand_inline_numerals(self, line: str) -> List[str]:
+        """
+        Expand a line containing inline numerals into multiple lines.
+
+        For example:
+            "1.- texto y 2.- texto y 3.- texto"
+        becomes:
+            ["1.- texto", "2.- texto", "3.- texto"]
+
+        This preprocessing step allows the main splitting logic to handle
+        inline numerals the same way as line-start numerals.
+
+        Args:
+            line: Line to expand
+
+        Returns:
+            List of lines (original line if no inline numerals, split lines if found)
+        """
+        # Check if line has any inline numerals
+        has_inline = False
+        for pattern in self.inline_numeral_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                has_inline = True
+                break
+
+        if not has_inline:
+            return [line]
+
+        # Split by inline numerals
+        result = []
+        remaining = line
+
+        while remaining:
+            # Try to match an inline numeral
+            inline_match = self._match_inline_numeral(remaining)
+
+            if inline_match:
+                # Found inline numeral
+                # Add prefix (if non-empty) as separate line
+                if inline_match['prefix_text']:
+                    result.append(inline_match['prefix_text'])
+
+                # Continue with the numeral part + remaining text
+                # Format as "N.- remaining_text" so main logic can match it
+                numeral_line = f"{inline_match['number']}.- {inline_match['remaining_text']}"
+                remaining = numeral_line
+
+                # Check if this numeral_line has MORE inline numerals
+                has_more_inline = False
+                for pattern in self.inline_numeral_patterns:
+                    if re.search(pattern, numeral_line, re.IGNORECASE):
+                        has_more_inline = True
+                        break
+
+                if not has_more_inline:
+                    # No more inline numerals, add this line and stop
+                    result.append(numeral_line)
+                    break
+            else:
+                # No more inline numerals
+                result.append(remaining)
+                break
+
+        return result if result else [line]
 
     def _match_letra(self, line: str) -> Optional[Dict]:
         """
@@ -347,11 +463,61 @@ def extract_subdivisions_metadata(article_text: str) -> List[Dict]:
 
         current_pos += line_len
 
-    # Calculate end positions (next subdivision start or text end)
+    # Calculate end positions (next subdivision start or paragraph break)
     for i, subdivision in enumerate(subdivisions):
         if i < len(subdivisions) - 1:
+            # Not the last subdivision: ends where next one starts
             subdivision["end"] = subdivisions[i + 1]["start"] - 1
         else:
-            subdivision["end"] = len(article_text)
+            # Last subdivision: find actual end (not article end)
+            # Look for paragraph break after this subdivision's start
+            start_pos = subdivision["start"]
+
+            # Find the next paragraph break (double newline or newline + indent)
+            # This signals transition from subdivision to article-level content
+            end_pos = _find_subdivision_end(article_text, start_pos)
+
+            subdivision["end"] = end_pos
 
     return subdivisions
+
+
+def _find_subdivision_end(text: str, start_pos: int) -> int:
+    """
+    Find the actual end of a subdivision's text.
+
+    Looks for paragraph breaks that signal the transition from
+    subdivision content to article-level content.
+
+    Args:
+        text: Full article text
+        start_pos: Start position of this subdivision
+
+    Returns:
+        End position of the subdivision (exclusive)
+    """
+    # Look for paragraph breaks after the subdivision starts
+    # Pattern 1: Double newline (explicit paragraph break)
+    # Pattern 2: Newline + significant indent (>= 5 spaces)
+
+    search_start = start_pos + 50  # Skip the subdivision header itself
+
+    # Search for double newline
+    double_newline = text.find('\n\n', search_start)
+
+    # Search for newline + indent pattern
+    # This pattern matches: \n followed by 5+ spaces, followed by uppercase letter or "En caso"
+    # (common patterns for article-level incisos)
+    import re
+    indent_pattern = r'\n {5,}[A-ZÁ]'  # Newline + 5+ spaces + uppercase letter
+    match = re.search(indent_pattern, text[search_start:])
+    indent_break = match.start() + search_start if match else -1
+
+    # Take the nearest break (if any exist)
+    breaks = [b for b in [double_newline, indent_break] if b > search_start]
+
+    if breaks:
+        return min(breaks)
+    else:
+        # No paragraph break found: subdivision extends to end of article
+        return len(text)

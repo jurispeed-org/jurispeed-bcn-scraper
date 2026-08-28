@@ -157,11 +157,9 @@ async def retry_failed_norms(
                     data["chunks"] = [
                         {
                             "chunk_index": c.chunk_index,
-                            "article_number": c.metadata.get("article_number"),
-                            "vigente": c.metadata.get("vigente"),
                             "token_count": c.token_count,
                             "content": c.text,
-                            "metadata": c.metadata
+                            "metadata": c.metadata  # Contains article_label (string) instead of article_number (int)
                         }
                         for c in chunks
                     ]

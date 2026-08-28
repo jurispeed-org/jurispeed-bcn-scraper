@@ -49,7 +49,7 @@ class ProfessionalChunker:
         max_chunk_size: int = 2048,  # tokens (hard limit for non-article chunks)
         overlap_tokens: int = 200,  # overlap for context (increased for legal text)
         min_chunk_size: int = 100,  # avoid tiny chunks
-        article_max_size: int = 8192,  # max size for a single article before splitting (4× increased)
+        article_max_size: int = 7500,  # max size for a single article before splitting (safety margin for embeddings)
     ):
         self.target_chunk_size = target_chunk_size
         self.max_chunk_size = max_chunk_size
@@ -108,6 +108,7 @@ class ProfessionalChunker:
         # Extract hierarchy from XML (preferred) or HTML
         hierarchy = {}
         article_texts = {}
+        binary_map = {}
 
         if xml_content and norm_id:
             # Use XML parser (preferred)
@@ -116,6 +117,7 @@ class ProfessionalChunker:
                 parser = BCNXMLParser()
                 hierarchy = parser.extract_article_hierarchy(xml_content, norm_id)
                 article_texts = parser.extract_article_texts(xml_content)
+                binary_map = parser.extract_binary_content(xml_content, norm_id)
                 logger.debug("xml_hierarchy_loaded", total_parts=len(hierarchy))
             except Exception as e:
                 logger.warning("xml_hierarchy_extraction_failed", error=str(e))
@@ -150,8 +152,8 @@ class ProfessionalChunker:
                     except Exception as e:
                         logger.warning("structural_context_extraction_failed", error=str(e))
 
-                # Chunk articles with structural context
-                article_chunks = self._chunk_by_xml(article_texts, hierarchy, metadata, structural_context)
+                # Chunk articles with structural context and binary content detection
+                article_chunks = self._chunk_by_xml(article_texts, hierarchy, metadata, structural_context, binary_map)
 
                 # NO special chunks - ruta viaja CON el articulo
                 chunks = article_chunks
@@ -171,8 +173,46 @@ class ProfessionalChunker:
             logger.info("chunking_legal_text_with_articles")
             chunks = self._chunk_by_articles(text)
         else:
-            logger.info("chunking_generic_text")
-            chunks = self._chunk_by_semantic_boundaries(text)
+            # No articles detected - check if it's a non-articulated legal norm
+            norm_type = metadata.get("norm_type", "").lower() if metadata else ""
+
+            # Types without article structure (BCN types)
+            non_articulated_types = [
+                "orden",           # Orden (like Carabineros)
+                "ordenanza",       # Ordenanza municipal
+                "oficio",          # Oficio
+                "resolucion",      # Resolución
+                "circular",        # Circular
+                "instruccion",     # Instrucción
+                "acuerdo",         # Acuerdo
+            ]
+
+            is_non_articulated = norm_type in non_articulated_types
+
+            if is_non_articulated:
+                # Special handling for non-articulated norms
+                estimated_tokens = self.estimate_tokens(text)
+
+                if estimated_tokens <= self.article_max_size:
+                    # Single chunk for the complete document
+                    chunks = [text]
+                    logger.info(
+                        "single_chunk_non_articulated",
+                        norm_type=norm_type,
+                        tokens=estimated_tokens
+                    )
+                else:
+                    # Too large, chunk by structural sections
+                    logger.info(
+                        "chunking_non_articulated_by_sections",
+                        norm_type=norm_type,
+                        tokens=estimated_tokens
+                    )
+                    chunks = self._chunk_by_sections(text)
+            else:
+                # Generic text (not legal or unknown type)
+                logger.info("chunking_generic_text")
+                chunks = self._chunk_by_semantic_boundaries(text)
 
         # Add overlap for context preservation (skip for article-based chunks)
         if not has_articles:
@@ -463,7 +503,9 @@ class ProfessionalChunker:
         chunks = []
 
         # Get norm metadata for contextual headers
-        norm_citation = base_metadata.get("norm_type", "") + " N° " + str(base_metadata.get("norm_number", ""))
+        norm_type_raw = base_metadata.get("norm_type", "ley")
+        norm_type_display = self._format_norm_type_for_citation(norm_type_raw)
+        norm_citation = norm_type_display + " N° " + str(base_metadata.get("norm_number", ""))
         norm_title = base_metadata.get("norm_title", "")
 
         for part_id, part_info in hierarchy.items():
@@ -637,16 +679,18 @@ class ProfessionalChunker:
         article_texts: Dict[str, str],
         hierarchy: dict,
         base_metadata: Optional[Dict] = None,
-        structural_context: Optional[Dict[str, Dict]] = None
+        structural_context: Optional[Dict[str, Dict]] = None,
+        binary_map: Optional[Dict[str, dict]] = None
     ) -> List[Dict]:
         """
-        Chunk by XML article texts with full structural context.
+        Chunk by XML article texts with full structural context and binary content detection.
 
         Args:
             article_texts: Dict mapping idParte -> article text
             hierarchy: Dict mapping idParte -> article metadata
             base_metadata: Base metadata (norm info) to include in all chunks
             structural_context: Dict mapping idParte -> structural context (book/title/section)
+            binary_map: Dict mapping idParte -> binary content info (images/tables)
 
         Returns:
             List of dicts with 'text' and 'metadata' keys
@@ -665,7 +709,9 @@ class ProfessionalChunker:
         structural_context = structural_context or {}
 
         # Get norm metadata for contextual headers
-        norm_citation = base_metadata.get("norm_type", "") + " N° " + str(base_metadata.get("norm_number", ""))
+        norm_type_raw = base_metadata.get("norm_type", "ley")
+        norm_type_display = self._format_norm_type_for_citation(norm_type_raw)
+        norm_citation = norm_type_display + " N° " + str(base_metadata.get("norm_number", ""))
         norm_title = base_metadata.get("norm_title", "")
 
         for part_id, article_text in article_texts.items():
@@ -764,6 +810,28 @@ class ProfessionalChunker:
                 "formatted_citation": formatted_citation,  # Formal citation
             })
 
+            # Check for binary content (images/tables) in this article
+            binary_info = binary_map.get(part_id) if binary_map else None
+            if binary_info:
+                # Add binary content metadata
+                chunk_metadata["binary_content"] = binary_info
+                chunk_metadata["content_complete"] = False
+
+                # Add textual note to warn users
+                binary_note = (
+                    "\n\n[NOTA: Este artículo contiene contenido binario (tabla o imagen) "
+                    "no indexado. Para ver el contenido completo, consulte el documento "
+                    "original en el sitio oficial de la Biblioteca del Congreso Nacional.]"
+                )
+                full_text += binary_note
+
+                logger.debug(
+                    "binary_content_detected_in_chunk",
+                    part_id=part_id,
+                    article_number=article_num,
+                    binary_type=binary_info.get("type")
+                )
+
             tokens = self.estimate_tokens(full_text)
             if tokens <= self.article_max_size:
                 chunks.append({
@@ -778,20 +846,152 @@ class ProfessionalChunker:
                     subdivisions=len(subdivisions)
                 )
             else:
-                # Article too large (rare), split by paragraphs as fallback
-                logger.warning(
-                    "splitting_large_article",
-                    part_id=part_id,
-                    article_number=article_num,
-                    tokens=tokens
-                )
-                sub_chunks_text = self._split_by_separator(article_text, r"\n\n")
-                for sub_text in sub_chunks_text:
-                    full_sub_text = contextual_header + sub_text
-                    chunks.append({
-                        "text": full_sub_text,
-                        "metadata": chunk_metadata.copy()
-                    })
+                # Article too large, split by subdivisions for semantic coherence
+                if subdivisions and len(subdivisions) > 0:
+                    # Split by complete subdivisions (numerales, letras)
+                    logger.info(
+                        "splitting_by_subdivisions",
+                        part_id=part_id,
+                        article_number=article_num,
+                        tokens=tokens,
+                        subdivisions_count=len(subdivisions)
+                    )
+
+                    for subdiv_idx, subdiv in enumerate(subdivisions):
+                        # Extract subdivision text using positions
+                        subdiv_text = article_text[subdiv['start']:subdiv['end']]
+
+                        # Build contextual header with fragment indicator
+                        subdivision_context = self._build_subdivision_context(
+                            norm_citation, norm_title, context, article_label, subdiv['mark']
+                        )
+                        full_sub_text = subdivision_context + subdiv_text
+
+                        # Check if this single subdivision is too large
+                        subdiv_tokens = self.estimate_tokens(full_sub_text)
+
+                        if subdiv_tokens > self.article_max_size:
+                            # Subdivision itself is too large, split by paragraphs
+                            logger.warning(
+                                "subdivision_too_large_splitting_by_paragraphs",
+                                part_id=part_id,
+                                article_number=article_num,
+                                subdivision=subdiv['mark'],
+                                tokens=subdiv_tokens
+                            )
+
+                            # Split subdivision text by paragraphs
+                            subdiv_paragraphs = self._split_by_separator(subdiv_text, r"\n\n")
+
+                            for para_idx, para_text in enumerate(subdiv_paragraphs):
+                                # Rebuild full text with context header
+                                full_para_text = subdivision_context + para_text
+
+                                # Add binary note to last paragraph of last subdivision if present
+                                if binary_info and subdiv_idx == len(subdivisions) - 1 and para_idx == len(subdiv_paragraphs) - 1:
+                                    binary_note = (
+                                        "\n\n[NOTA: Este artículo contiene contenido binario (tabla o imagen) "
+                                        "no indexado. Para ver el contenido completo, consulte el documento "
+                                        "original en el sitio oficial de la Biblioteca del Congreso Nacional.]"
+                                    )
+                                    full_para_text += binary_note
+
+                                # Mark as paragraph fragment of subdivision
+                                para_metadata = chunk_metadata.copy()
+                                para_metadata.update({
+                                    "is_fragment": True,
+                                    "fragment_of": article_label,
+                                    "subdivision_mark": subdiv['mark'],
+                                    "subdivision_type": subdiv['type'],
+                                    "subdivision_index": subdiv_idx + 1,
+                                    "total_subdivisions": len(subdivisions),
+                                    "paragraph_fragment": True,
+                                    "paragraph_index": para_idx + 1,
+                                    "total_paragraphs": len(subdiv_paragraphs)
+                                })
+
+                                chunks.append({
+                                    "text": full_para_text,
+                                    "metadata": para_metadata
+                                })
+
+                                logger.debug(
+                                    "subdivision_paragraph_chunk_created",
+                                    part_id=part_id,
+                                    article_number=article_num,
+                                    subdivision=subdiv['mark'],
+                                    paragraph=f"{para_idx+1}/{len(subdiv_paragraphs)}",
+                                    tokens=self.estimate_tokens(full_para_text)
+                                )
+                        else:
+                            # Subdivision within limit, use as single chunk
+                            # Add binary note to last subdivision if present
+                            if binary_info and subdiv_idx == len(subdivisions) - 1:
+                                binary_note = (
+                                    "\n\n[NOTA: Este artículo contiene contenido binario (tabla o imagen) "
+                                    "no indexado. Para ver el contenido completo, consulte el documento "
+                                    "original en el sitio oficial de la Biblioteca del Congreso Nacional.]"
+                                )
+                                full_sub_text += binary_note
+
+                            # Clone metadata and mark as fragment
+                            sub_metadata = chunk_metadata.copy()
+                            sub_metadata.update({
+                                "is_fragment": True,
+                                "fragment_of": article_label,
+                                "subdivision_mark": subdiv['mark'],
+                                "subdivision_type": subdiv['type'],
+                                "subdivision_index": subdiv_idx + 1,
+                                "total_subdivisions": len(subdivisions)
+                            })
+
+                            chunks.append({
+                                "text": full_sub_text,
+                                "metadata": sub_metadata
+                            })
+
+                            logger.debug(
+                                "subdivision_chunk_created",
+                                part_id=part_id,
+                                article_number=article_num,
+                                subdivision=subdiv['mark'],
+                                tokens=subdiv_tokens
+                            )
+                else:
+                    # No subdivisions detected, fallback to paragraph split
+                    logger.warning(
+                        "splitting_large_article_no_subdivisions",
+                        part_id=part_id,
+                        article_number=article_num,
+                        tokens=tokens
+                    )
+                    sub_chunks_text = self._split_by_separator(article_text, r"\n\n")
+                    for sub_idx, sub_text in enumerate(sub_chunks_text):
+                        full_sub_text = contextual_header + sub_text
+
+                        # Add binary note to last sub-chunk if present
+                        if binary_info and sub_idx == len(sub_chunks_text) - 1:
+                            binary_note = (
+                                "\n\n[NOTA: Este artículo contiene contenido binario (tabla o imagen) "
+                                "no indexado. Para ver el contenido completo, consulte el documento "
+                                "original en el sitio oficial de la Biblioteca del Congreso Nacional.]"
+                            )
+                            full_sub_text += binary_note
+
+                        # Mark as fragment split by paragraphs
+                        sub_metadata = chunk_metadata.copy()
+                        sub_metadata.update({
+                            "is_fragment": True,
+                            "fragment_of": article_label,
+                            "paragraph_fragment": True,
+                            "fragment_index": sub_idx + 1,
+                            "total_fragments": len(sub_chunks_text)
+                        })
+
+                        chunks.append({
+                            "text": full_sub_text,
+                            "metadata": sub_metadata
+                        })
 
         logger.info("xml_chunking_complete", total_chunks=len(chunks))
         return chunks
@@ -820,7 +1020,9 @@ class ProfessionalChunker:
         special_chunks = []
 
         # Get norm metadata for contextual headers
-        norm_citation = base_metadata.get("norm_type", "") + " N° " + str(base_metadata.get("norm_number", ""))
+        norm_type_raw = base_metadata.get("norm_type", "ley")
+        norm_type_display = self._format_norm_type_for_citation(norm_type_raw)
+        norm_citation = norm_type_display + " N° " + str(base_metadata.get("norm_number", ""))
         norm_title = base_metadata.get("norm_title", "")
 
         # Combine all article texts to find what's NOT in articles
@@ -1108,6 +1310,90 @@ class ProfessionalChunker:
 
         return chunks
 
+    def _chunk_by_sections(self, text: str) -> List[str]:
+        """
+        Chunk non-articulated norms by structural sections.
+
+        Used for norms without articles (orden, ordenanza, oficio, etc.)
+        that exceed article_max_size (8192 tokens).
+
+        Detects sections like:
+        - "Vistos:"
+        - "Considerando:"
+        - "Se ordena:" / "Resuelve:" / "Decreta:" / "Acuerda:"
+
+        Each section becomes a complete chunk (no mid-section cuts).
+
+        Returns:
+            List of text chunks, one per section
+        """
+        chunks = []
+
+        # Section markers (Spanish legal document structure)
+        section_patterns = [
+            (r'\n\s*(Vistos?:)', 'Vistos'),
+            (r'\n\s*(Considerando:)', 'Considerando'),
+            (r'\n\s*(Se\s+ordena:)', 'Se ordena'),
+            (r'\n\s*(Resuelve:)', 'Resuelve'),
+            (r'\n\s*(Decreta:)', 'Decreta'),
+            (r'\n\s*(Acuerda:)', 'Acuerda'),
+            (r'\n\s*(Dispone:)', 'Dispone'),
+        ]
+
+        # Find all section positions
+        section_positions = []
+        for pattern, section_name in section_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                section_positions.append((match.start(), section_name))
+
+        if not section_positions:
+            # No sections detected, fallback to semantic boundaries
+            logger.warning("no_sections_detected_fallback")
+            return self._chunk_by_semantic_boundaries(text)
+
+        # Sort by position
+        section_positions.sort(key=lambda x: x[0])
+
+        # Extract sections
+        for i, (start_pos, section_name) in enumerate(section_positions):
+            # Get end position (next section or end of text)
+            if i < len(section_positions) - 1:
+                end_pos = section_positions[i + 1][0]
+            else:
+                end_pos = len(text)
+
+            # Extract section text
+            section_text = text[start_pos:end_pos].strip()
+
+            # Check if section is too large
+            tokens = self.estimate_tokens(section_text)
+
+            if tokens <= self.article_max_size:
+                # Section fits in one chunk
+                chunks.append(section_text)
+                logger.debug(
+                    "section_chunk_created",
+                    section=section_name,
+                    tokens=tokens
+                )
+            else:
+                # Section too large, split by paragraphs
+                logger.warning(
+                    "splitting_large_section",
+                    section=section_name,
+                    tokens=tokens
+                )
+                sub_chunks = self._chunk_by_semantic_boundaries(section_text)
+                chunks.extend(sub_chunks)
+
+        logger.info(
+            "chunking_by_sections_complete",
+            total_sections=len(section_positions),
+            total_chunks=len(chunks)
+        )
+
+        return chunks
+
     def _add_overlap(self, chunks: List[str], original_text: str) -> List[str]:
         """
         Add overlap between chunks for context preservation.
@@ -1196,6 +1482,72 @@ class ProfessionalChunker:
         header = " · ".join(parts)
         return f"{header}\n\n"
 
+    def _build_subdivision_context(
+        self,
+        norm_citation: str,
+        norm_title: str,
+        context: Dict,
+        article_label: str,
+        subdivision_mark: str
+    ) -> str:
+        """
+        Build contextual header for article subdivisions (fragments).
+
+        This creates self-contained chunks where each subdivision includes
+        full context about the norm, article, and position.
+
+        Example output:
+            "Decreto Ley N° 824 · TÍTULO VI (Disposiciones especiales relativas al
+            mercado de capitales) · Artículo 104
+
+            [Fragmento del artículo completo - Numeral 1.-]
+
+            "
+
+        Args:
+            norm_citation: Formal citation (e.g., "Decreto Ley N° 824")
+            norm_title: Norm title for context
+            context: Structural context (book, title, section)
+            article_label: Article identifier (e.g., "104")
+            subdivision_mark: Subdivision marker (e.g., "1.-", "a)")
+
+        Returns:
+            Contextual header string with fragment indicator
+        """
+        parts = [norm_citation]
+
+        # Add structural hierarchy with names
+        if context.get("book"):
+            book_full = context["book"]
+            if context.get("book_name"):
+                book_full += f" ({context['book_name']})"
+            parts.append(book_full)
+
+        if context.get("title_ordinal"):
+            title_full = context["title_ordinal"]
+            if context.get("title_name"):
+                title_full += f" ({context['title_name']})"
+            parts.append(title_full)
+
+        if context.get("section"):
+            section_full = context["section"]
+            if context.get("section_name"):
+                section_full += f" - {context['section_name']}"
+            parts.append(section_full)
+
+        # Add article
+        parts.append(f"Artículo {article_label}")
+
+        # Build header with fragment indicator
+        header = " · ".join(parts)
+
+        # Determine subdivision type from mark
+        subdiv_type = "Numeral" if subdivision_mark[0].isdigit() else "Letra"
+
+        fragment_note = f"\n\n[Fragmento del artículo completo - {subdiv_type} {subdivision_mark}]\n\n"
+
+        return header + fragment_note
+
     def _build_structured_path(self, context: Dict) -> Dict:
         """
         Build structured path as nested dictionary.
@@ -1229,6 +1581,52 @@ class ProfessionalChunker:
 
         return path
 
+    def _format_norm_type_for_citation(self, norm_type: str) -> str:
+        """
+        Format norm_type for formal citations (Hallazgo #7).
+
+        Converts enum values to proper display format:
+        - "ley" → "Ley"
+        - "codigo" → "Código"
+        - "orden" → "Orden"
+        - "decreto_ley" → "Decreto Ley"
+
+        Args:
+            norm_type: Raw norm_type value (from enum.value)
+
+        Returns:
+            Formatted type for citation display
+        """
+        # Mapping for special cases
+        SPECIAL_FORMATS = {
+            "dfl": "DFL",
+            "decreto_ley": "Decreto Ley",
+            "decreto_supremo": "Decreto Supremo",
+            "ordenanza_municipal": "Ordenanza Municipal",
+            "auto_acordado": "Auto Acordado",
+        }
+
+        if norm_type in SPECIAL_FORMATS:
+            return SPECIAL_FORMATS[norm_type]
+
+        # Default: capitalize first letter, replace underscores
+        # "ley" → "Ley", "codigo" → "Codigo"
+        formatted = norm_type.replace("_", " ").capitalize()
+
+        # Add accent to "Código" if needed
+        if formatted.lower() == "codigo":
+            formatted = "Código"
+
+        # Add accent to "Resolución" if needed
+        if formatted.lower() == "resolucion":
+            formatted = "Resolución"
+
+        # Add accent to "Instrucción" if needed
+        if formatted.lower() == "instruccion":
+            formatted = "Instrucción"
+
+        return formatted
+
     def _build_formatted_citation(
         self,
         norm_citation: str,
@@ -1238,8 +1636,15 @@ class ProfessionalChunker:
         """
         Build formal legal citation.
 
-        Example: "Código Penal, Artículo 390 ter"
-        Example with structure: "Código Penal, Libro Segundo, Título Octavo, §1 bis, Artículo 390 ter"
+        This fixes Hallazgo #7: Cita e identidad mal.
+
+        Changes:
+        - Uses "art." instead of "Artículo" (formal legal citation style)
+        - Preserves original case of article_label (no uppercasing)
+        - Includes section name if present (e.g., "Del femicidio")
+
+        Example: "Código Penal, art. 390 ter"
+        Example with structure: "Código Penal, Libro Segundo, Título Octavo, §1 bis (Del femicidio), art. 390 ter"
         """
         citation_parts = [norm_citation]
 
@@ -1247,10 +1652,18 @@ class ProfessionalChunker:
             citation_parts.append(context["book"])
         if context.get("title_ordinal"):
             citation_parts.append(context["title_ordinal"])
-        if context.get("section"):
-            citation_parts.append(context["section"])
 
-        citation_parts.append(f"Artículo {article_label}")
+        # Include section with name (e.g., "§1 bis (Del femicidio)")
+        if context.get("section"):
+            section_str = context["section"]
+            section_name = context.get("section_name")
+            if section_name:
+                section_str = f"{section_str} ({section_name})"
+            citation_parts.append(section_str)
+
+        # Use "art." instead of "Artículo" (formal citation style)
+        # Preserve original case of article_label (no .lower() or .upper())
+        citation_parts.append(f"art. {article_label}")
 
         return ", ".join(citation_parts)
 

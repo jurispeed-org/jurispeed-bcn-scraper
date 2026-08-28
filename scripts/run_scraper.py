@@ -75,7 +75,7 @@ class ProductionScraper:
         self.xml_parser = BCNXMLParser()
         self.chunker = ProfessionalChunker(
             target_chunk_size=512,
-            article_max_size=8192,
+            article_max_size=7500,  # Safety margin for embeddings + context headers
             overlap_tokens=200
         )
         self.checkpoint_mgr = CheckpointManager(config.aws, instance_id)
@@ -214,7 +214,7 @@ class ProductionScraper:
                 article_texts = self.xml_parser.extract_article_texts(xml_content)
 
                 total_articles = len(hierarchy)
-                vigentes = sum(1 for info in hierarchy.values() if info.get('vigente'))
+                vigentes = sum(1 for info in hierarchy.values() if info.get('in_force', True))
 
                 # Chunk with XML data
                 metadata = {
@@ -269,11 +269,9 @@ class ProductionScraper:
             data["chunks"] = [
                 {
                     "chunk_index": c.chunk_index,
-                    "article_number": c.metadata.get("article_number"),
-                    "vigente": c.metadata.get("vigente"),
                     "token_count": c.token_count,
                     "content": c.text,
-                    "metadata": c.metadata
+                    "metadata": c.metadata  # Contains article_label (string) instead of article_number (int)
                 }
                 for c in chunks
             ]
