@@ -6,6 +6,7 @@ Schema: EsquemaIntercambioNorma-v1-0.xsd
 """
 
 import xml.etree.ElementTree as ET
+import re
 from typing import Dict, List, Optional, Tuple
 from datetime import date
 import structlog
@@ -60,16 +61,13 @@ class BCNXMLParser:
         try:
             root = ET.fromstring(xml_content)
 
-            # Extract metadata
             metadata = self._extract_metadata(root, norm_id)
             if not metadata:
                 logger.error("metadata_extraction_failed", norm_id=norm_id)
                 return None
 
-            # Extract full content
             full_content = self._extract_full_content(root)
 
-            # Create norm object
             norm = ChileanLegalNorm(**metadata, full_content=full_content)
 
             logger.info(
@@ -91,7 +89,6 @@ class BCNXMLParser:
     def _extract_metadata(self, root: ET.Element, norm_id: int) -> Optional[Dict]:
         """Extract metadata from XML."""
         try:
-            # Get Identificador
             identificador = root.find('ns:Identificador', self.NS)
             if identificador is None:
                 return None
@@ -108,11 +105,9 @@ class BCNXMLParser:
                 version_date_str = root.get('fechaVersion')
                 publication_date = promulgation_date or (date.fromisoformat(version_date_str) if version_date_str else date.today())
 
-            # Last modified (from root)
             version_date_str = root.get('fechaVersion')
             last_modified = date.fromisoformat(version_date_str) if version_date_str else None
 
-            # Type and number
             type_number_elem = identificador.find('.//ns:TipoNumero', self.NS)
             if type_number_elem is None:
                 return None
@@ -126,46 +121,45 @@ class BCNXMLParser:
             type_text = type_elem.text.strip()
             number_text = number_elem.text.strip()
 
-            # Map type to NormType
             norm_type = self._map_tipo_to_norm_type(type_text)
 
-            # Issuing body
             organism_elem = identificador.find('.//ns:Organismo', self.NS)
             issuing_body = organism_elem.text.strip() if organism_elem is not None else "MINISTERIO"
 
-            # Metadata
             metadata_elem = root.find('ns:Metadatos', self.NS)
             title_elem = metadata_elem.find('ns:TituloNorma', self.NS) if metadata_elem is not None else None
             title_raw = title_elem.text.strip() if title_elem is not None and title_elem.text else f"{type_text} {number_text}"
 
-            # Clean duplicated titles (Hallazgo #7)
-            # Example: if type_text="Código" and title_raw="CÓDIGO PENAL", avoid "Código 1984: CÓDIGO PENAL"
+            # Clean duplicated titles - avoid "Código 1984: CÓDIGO PENAL"
             title_clean = self._clean_duplicate_title(type_text, number_text, title_raw)
 
-            # Summary (must be at least 50 chars for Pydantic validation)
-            base_summary = f"{type_text} {number_text}: {title_clean}"
+            # Try to extract known código name first for better title formatting
+            codigo_name = self._extract_codigo_name_static(type_text, number_text, title_raw)
+            if codigo_name:
+                # Use clean código name: "Código Penal" instead of "Código PENAL: CÓDIGO PENAL"
+                final_title = codigo_name
+            else:
+                final_title = f"{type_text} {number_text}: {title_clean}"
 
-            # Ensure minimum 50 chars
+            # Summary (must be at least 50 chars for Pydantic validation)
+            base_summary = final_title
+
             if len(base_summary) < 50:
-                # Add publication info
                 pub_date_str = f"Publicado el {publication_date_str}" if publication_date_str else ""
                 base_summary = f"{base_summary}. {pub_date_str}"
 
-                # If still too short, add issuing body
                 if len(base_summary) < 50:
                     base_summary = f"{base_summary}. Emitido por {issuing_body}"
 
-            # Truncate if too long
             summary = base_summary[:500]
 
-            # Official URL
             official_url = f"https://bcn.cl/leychile/navegar?idNorma={norm_id}"
 
             return {
                 "norm_id": norm_id,
                 "norm_type": norm_type,
                 "norm_number": number_text,
-                "title": f"{type_text} {number_text}: {title_clean}",
+                "title": final_title,
                 "publication_date": publication_date,
                 "promulgation_date": promulgation_date,
                 "last_modified": last_modified,
@@ -180,18 +174,35 @@ class BCNXMLParser:
             logger.error("metadata_extraction_error", error=str(e))
             return None
 
+    def extract_norm_vigencia(self, xml_content: str) -> bool:
+        """
+        Extract global in_force status from XML root derogado attribute.
+
+        Extract vigencia from XML root to propagate to non-articulated chunks.
+
+        Returns:
+            True if norm is in force (derogado != "1"), False otherwise
+        """
+        try:
+            root = ET.fromstring(xml_content)
+            norma = root.find('.//ns:Norma', self.NS)
+            if norma is not None:
+                derogado = norma.get('derogado', '0')
+                return derogado != '1'
+            return True
+        except Exception as e:
+            logger.warning("vigencia_extraction_error", error=str(e))
+            return True  # Default to in_force if extraction fails
+
     def _map_tipo_to_norm_type(self, type_str: str) -> NormType:
         """
         Map XML type to NormType enum.
 
         BCN's <Tipo> element contains the specific norm type.
         We map it to our expanded NormType enum.
-
-        This fixes Hallazgo #7: norm_type incorrect.
         """
         type_clean = type_str.strip().lower()
 
-        # Exact matches first (most specific)
         EXACT_MAP = {
             'codigo': NormType.CODIGO,
             'código': NormType.CODIGO,
@@ -214,9 +225,17 @@ class BCNXMLParser:
             'convenio': NormType.CONVENIO,
             'tratado': NormType.TRATADO,
             'auto acordado': NormType.AUTO_ACORDADO,
+            'sentencia': NormType.SENTENCIA,
+            'certificado': NormType.CERTIFICADO,
+            'dictamen': NormType.DICTAMEN,
+            'aviso': NormType.AVISO,
+            'bando': NormType.BANDO,
+            'notificacion': NormType.NOTIFICACION,
+            'notificación': NormType.NOTIFICACION,
+            'mensaje': NormType.MENSAJE,
+            'otro': NormType.OTRO,
         }
 
-        # Check exact matches
         if type_clean in EXACT_MAP:
             return EXACT_MAP[type_clean]
 
@@ -255,16 +274,31 @@ class BCNXMLParser:
             return NormType.TRATADO
         elif 'auto acordado' in type_clean:
             return NormType.AUTO_ACORDADO
+        elif 'sentencia' in type_clean:
+            return NormType.SENTENCIA
+        elif 'certificado' in type_clean:
+            return NormType.CERTIFICADO
+        elif 'dictamen' in type_clean:
+            return NormType.DICTAMEN
+        elif 'aviso' in type_clean:
+            return NormType.AVISO
+        elif 'bando' in type_clean:
+            return NormType.BANDO
+        elif 'notificacion' in type_clean or 'notificación' in type_clean:
+            return NormType.NOTIFICACION
+        elif 'mensaje' in type_clean:
+            return NormType.MENSAJE
+        elif 'otro' in type_clean:
+            return NormType.OTRO
         elif 'ley' in type_clean:
             return NormType.LEY
         else:
-            # Default fallback
             logger.warning("unknown_norm_type", type_str=type_str)
             return NormType.LEY
 
     def _clean_duplicate_title(self, type_text: str, number_text: str, title_raw: str) -> str:
         """
-        Clean duplicate titles (Hallazgo #7).
+        Clean duplicate titles.
 
         Examples of problems:
         - "Código PENAL: CÓDIGO PENAL" → should be "Código Penal"
@@ -285,20 +319,13 @@ class BCNXMLParser:
         title_lower = title_raw.lower()
         type_lower = type_text.lower()
 
-        # Check if title starts with the type (duplicate)
         if title_lower.startswith(type_lower):
-            # Remove the duplicate type from title
-            # Example: "CÓDIGO PENAL" → "PENAL"
             remaining = title_raw[len(type_text):].strip()
-
-            # Remove leading punctuation (: - etc.)
             remaining = remaining.lstrip(':').lstrip('-').strip()
 
-            # If remaining is just the number, keep the original title
             if remaining == number_text or not remaining:
                 return title_raw
 
-            # Use the remaining part
             title_clean = remaining
         else:
             title_clean = title_raw
@@ -310,6 +337,54 @@ class BCNXMLParser:
 
         return title_clean
 
+    def _extract_codigo_name_static(self, type_text: str, number_text: str, title_raw: str) -> Optional[str]:
+        """
+        Extract proper name for códigos from type, number, and title.
+
+        Static version of ChileanLegalNorm._extract_codigo_name() for use in XML parsing.
+
+        Examples:
+            "Código", "PENAL", "CÓDIGO PENAL" -> "Código Penal"
+            "Código", "1855", "Codigo Civil" -> "Código Civil"
+
+        Returns:
+            Clean código name or None if not extractable
+        """
+        # Well-known códigos mapping
+        KNOWN_CODIGOS = {
+            'penal': 'Código Penal',
+            '1855': 'Código Civil',
+            'civil': 'Código Civil',
+            'tributario': 'Código Tributario',
+            'comercio': 'Código de Comercio',
+            'trabajo': 'Código del Trabajo',
+            'procedimiento civil': 'Código de Procedimiento Civil',
+            'procedimiento penal': 'Código Procesal Penal',
+            'mineria': 'Código de Minería',
+            'minería': 'Código de Minería',
+            'aguas': 'Código de Aguas',
+        }
+
+        # Check norm_number first (most reliable)
+        norm_num_lower = number_text.lower()
+        if norm_num_lower in KNOWN_CODIGOS:
+            return KNOWN_CODIGOS[norm_num_lower]
+
+        title_lower = title_raw.lower()
+        for key, name in KNOWN_CODIGOS.items():
+            if key in title_lower:
+                return name
+
+        if ':' in title_raw:
+            parts = title_raw.split(':', 1)
+            if len(parts) == 2:
+                after_colon = parts[1].strip().title()
+                # Avoid duplicated words like "Código Código"
+                if after_colon.lower().startswith('codigo'):
+                    return after_colon
+
+        return None
+
     def _extract_full_content(self, root: ET.Element) -> str:
         """
         Extract full text content from XML.
@@ -319,14 +394,12 @@ class BCNXMLParser:
         """
         content_parts = []
 
-        # Header
         header = root.find('ns:Encabezado/ns:Texto', self.NS)
         if header is not None:
             text = self._extract_text_without_binaries(header)
             if text:
                 content_parts.append(text)
 
-        # All functional structure texts
         for structure in root.findall('.//ns:EstructuraFuncional', self.NS):
             text_elem = structure.find('ns:Texto', self.NS)
             if text_elem is not None:
@@ -348,7 +421,7 @@ class BCNXMLParser:
         - hierarchy is native XML tree
         - fechaVersion per article
 
-        IMPORTANT: Detects nested structures (Hallazgo #6):
+        IMPORTANT: Detects nested structures:
         - Articles inside N°/romano/TÍTULO are marked as nested
         - parent_article is set to the parent container number
         """
@@ -356,33 +429,33 @@ class BCNXMLParser:
             root = ET.fromstring(xml_content)
             hierarchy = {}
 
-            # Build parent map for upward navigation
             parent_map = {c: p for p in root.iter() for c in p}
 
-            # Find all articles
             for structure in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
                 id_parte = structure.get('idParte')
                 if not id_parte:
                     continue
 
-                # Get article name
                 name_elem = structure.find('.//ns:NombreParte', self.NS)
                 article_label = name_elem.text.strip() if name_elem is not None and name_elem.text else None
 
                 if not article_label:
                     continue
 
-                # Extract article number
+                # Normalize suffixes to lowercase (390 BIS -> 390 bis)
+                article_label = re.sub(
+                    r'\b(BIS|TER|QUATER|QUINQUIES|SEXIES|SEPTIES|OCTIES|NONIES|DECIES)\b',
+                    lambda m: m.group(1).lower(),
+                    article_label
+                )
+
                 article_number = self._extract_article_number(article_label)
 
-                # Check if nested in two ways:
                 # 1. Legacy: has "DEL ART" in name
                 is_nested_legacy = 'DEL ART' in article_label.upper()
                 parent_article = None
 
                 if is_nested_legacy:
-                    # Extract parent article number from label
-                    import re
                     match = re.search(r'DEL ART[^\d]*(\d+)', article_label, re.IGNORECASE)
                     if match:
                         parent_article = int(match.group(1))
@@ -392,19 +465,18 @@ class BCNXMLParser:
                     structure, parent_map
                 )
 
-                # Combine both detections
-                is_nested = is_nested_legacy or is_nested_structural
+                # Only mark as nested if we have a valid parent_article
                 if parent_structural is not None:
                     parent_article = parent_structural
 
-                # Get hierarchy level (count parent elements)
+                # Only set is_nested=True if we actually found a parent article number
+                is_nested = parent_article is not None
+
                 hierarchy_level = self._get_hierarchy_level(structure, root)
 
-                # Validity status (repealed attribute from XML)
                 repealed_attr = structure.get('derogado', 'no derogado')
                 in_force = repealed_attr == 'no derogado'
 
-                # Version date
                 version_date_str = structure.get('fechaVersion')
 
                 hierarchy[id_parte] = {
@@ -417,10 +489,40 @@ class BCNXMLParser:
                     'version_date': version_date_str,
                 }
 
+            # Extract treaty annexes (Tratados internacionales)
+            # Anexos contain full treaty text that would otherwise be missed
+            for annex in root.findall('.//ns:Anexo', self.NS):
+                id_parte = annex.get('idParte')
+                if not id_parte:
+                    continue
+
+                title_elem = annex.find('.//ns:Titulo', self.NS)
+                annex_title = title_elem.text.strip() if title_elem is not None and title_elem.text else "Anexo"
+
+                repealed_attr = annex.get('derogado', 'no derogado')
+                in_force = repealed_attr == 'no derogado'
+
+                version_date_str = annex.get('fechaVersion')
+
+                annex_key = f"anexo_{id_parte}"
+
+                hierarchy[annex_key] = {
+                    'article_number': None,
+                    'article_label': 'Anexo',
+                    'annex_title': annex_title,
+                    'is_annex': True,
+                    'is_nested': False,
+                    'parent_article': None,
+                    'hierarchy_level': 0,
+                    'in_force': in_force,
+                    'version_date': version_date_str,
+                }
+
             logger.info(
                 "hierarchy_extracted",
                 norm_id=norm_id,
-                total_articles=len(hierarchy)
+                total_articles=len(hierarchy),
+                annexes=sum(1 for h in hierarchy.values() if h.get('is_annex', False))
             )
 
             return hierarchy
@@ -431,8 +533,6 @@ class BCNXMLParser:
 
     def _extract_article_number(self, article_label: str) -> Optional[int]:
         """Extract article number from label."""
-        import re
-
         # Pattern: "1", "2 (DEL ART 1)", etc.
         match = re.match(r'(\d+)', article_label)
         if match:
@@ -478,8 +578,6 @@ class BCNXMLParser:
         """
         Detect if an article is nested inside a parent structure (N°, romano, TÍTULO, etc.).
 
-        This fixes Hallazgo #6: Doble articulado no detectado.
-
         Example XML structure:
         <EstructuraFuncional tipoParte="N°" idParte="10534843">
             <Articulo>2.</Articulo>
@@ -498,10 +596,13 @@ class BCNXMLParser:
                 - parent_number: Number of parent container (e.g., 2 for "N° 2")
         """
         # Parent container types that can contain nested articles
+        # Only actual nested structures (articles within articles)
+        # TÍTULO, Capítulo, Sección are NORMAL hierarchy, not nested articles
         CONTAINER_TYPES = [
-            'N°', 'romano', 'TÍTULO', 'Título', 'Capítulo', 'Sección',
-            'Doble Articulado',  # Ordenanzas with nested article structure
-            'Párrafo'  # Some norms use Párrafo as container
+            'N°',               # Numbers within articles (nested structure)
+            'romano',           # Roman numerals within articles
+            'Doble Articulado', # Ordenanzas with nested article structure
+            'Párrafo'           # Some use Párrafo as container of articles
         ]
 
         # Traverse up to find parent EstructuraFuncional
@@ -542,8 +643,6 @@ class BCNXMLParser:
         - <Articulo>N° 2</Articulo> → 2
         - <Articulo>II</Articulo> → 2 (romano)
         """
-        import re
-
         # Get the <Articulo> or <NombreParte> element
         name_elem = container_element.find('.//ns:Articulo', self.NS)
         if name_elem is None:
@@ -632,9 +731,27 @@ class BCNXMLParser:
                     if text:
                         article_texts[id_parte] = text
 
+            # Extract treaty annex texts
+            # Annexes contain full treaty text that would otherwise be missed
+            for annex in root.findall('.//ns:Anexo', self.NS):
+                id_parte = annex.get('idParte')
+                if not id_parte:
+                    continue
+
+                # Get text element
+                text_elem = annex.find('ns:Texto', self.NS)
+                if text_elem is not None:
+                    # Extract all text, skipping binary attachments
+                    text = self._extract_text_without_binaries(text_elem)
+                    if text:
+                        # Use same special key as in hierarchy
+                        annex_key = f"anexo_{id_parte}"
+                        article_texts[annex_key] = text
+
             logger.debug(
                 "article_texts_extracted",
-                total_articles=len(article_texts)
+                total_articles=len(article_texts),
+                annexes=sum(1 for k in article_texts.keys() if k.startswith('anexo_'))
             )
 
             return article_texts
@@ -709,7 +826,8 @@ class BCNXMLParser:
                 break
 
             type_val = parent.get('tipoParte')
-            if type_val in ['Libro', 'Título', 'Párrafo']:
+            # Added "Capítulo" for Constitución and other norms
+            if type_val in ['Libro', 'Título', 'Capítulo', 'Párrafo']:
                 # Read <TituloParte> from Metadata (this is where BCN stores the full name)
                 title_elem = parent.find('.//ns:TituloParte', self.NS)
                 if title_elem is not None and title_elem.text:
@@ -719,6 +837,7 @@ class BCNXMLParser:
                     # Examples:
                     # "LIBRO SEGUNDO CRIMENES Y SIMPLES DELITOS Y SUS PENAS"
                     # "TITULO OCTAVO CRIMENES Y SIMPLES DELITOS CONTRA LAS PERSONAS"
+                    # "Capítulo I BASES DE LA INSTITUCIONALIDAD"
                     # "§1 bis. Del femicidio"
 
                     if type_val == 'Libro':
@@ -739,10 +858,19 @@ class BCNXMLParser:
                             context['title_ordinal'] = ordinal
                             context['title_name'] = name
 
+                    elif type_val == 'Capítulo':
+                        # Handle chapters (common in Constitución)
+                        # Extract "Capítulo I" and "BASES DE LA INSTITUCIONALIDAD"
+                        parts = full_text.split(maxsplit=2)
+                        if len(parts) >= 2:
+                            ordinal = f"{parts[0]} {parts[1]}"
+                            name = parts[2] if len(parts) > 2 else ""
+                            context['title_ordinal'] = ordinal
+                            context['title_name'] = name
+
                     elif type_val == 'Párrafo':
                         # Extract "§1 bis" and "Del femicidio"
                         # Pattern: "§N" or "§N bis/ter" followed by ". Name"
-                        import re
                         match = re.match(r'^(§\s*\d+(?:\s+[a-z]+)?)\.\s*(.*)$', full_text, re.IGNORECASE)
                         if match:
                             context['section'] = match.group(1).strip()
@@ -851,3 +979,50 @@ class BCNXMLParser:
                 error=str(e)
             )
             return {}
+
+    def extract_treaty_annex(self, xml_content: str, norm_id: int) -> Optional[str]:
+        """
+        Extract treaty annex content from XML.
+
+        Treaties (Tratados internacionales) often come with the treaty text
+        as an annex in the XML. The decree itself is typically short (promulgation),
+        while the full treaty text is in an <Anexo> or similar element.
+
+        TODO: This is a PLACEHOLDER that needs investigation of real treaty XML structure.
+              Download XML of a treaty (e.g., Tratado de Escazú) and examine:
+              - <Anexo> elements
+              - <Adjunto> elements
+              - Other possible containers for treaty text
+              Then implement extraction logic.
+
+        Args:
+            xml_content: Raw XML content
+            norm_id: Norm ID for logging
+
+        Returns:
+            Treaty annex text if found, None otherwise
+        """
+        try:
+            root = ET.fromstring(xml_content)
+
+            # TODO: Implement actual extraction once XML structure is known
+            # Possible patterns to investigate:
+            # - root.find('.//ns:Anexo', self.NS)
+            # - root.find('.//ns:Adjunto', self.NS)
+            # - Elements with tipoParte="Anexo" or similar
+
+            logger.info(
+                "treaty_annex_extraction_not_implemented",
+                norm_id=norm_id,
+                note="Placeholder - needs XML structure investigation"
+            )
+
+            return None
+
+        except Exception as e:
+            logger.warning(
+                "treaty_annex_extraction_failed",
+                norm_id=norm_id,
+                error=str(e)
+            )
+            return None

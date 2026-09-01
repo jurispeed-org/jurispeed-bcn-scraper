@@ -21,17 +21,14 @@ class NormType(str, Enum):
     This enum covers the most common types from BCN's taxonomy.
     """
 
-    # Primary legislation
     LEY = "ley"
     CODIGO = "codigo"
 
-    # Executive decrees
     DFL = "dfl"  # Decreto con Fuerza de Ley
     DL = "decreto_ley"  # Decreto Ley
     DECRETO = "decreto"
     DECRETO_SUPREMO = "decreto_supremo"
 
-    # Regulations and administrative
     REGLAMENTO = "reglamento"
     RESOLUCION = "resolucion"
     ORDEN = "orden"
@@ -40,14 +37,21 @@ class NormType(str, Enum):
     CIRCULAR = "circular"
     INSTRUCCION = "instruccion"
 
-    # Municipal
     ORDENANZA_MUNICIPAL = "ordenanza_municipal"
 
-    # Other
     ACUERDO = "acuerdo"
     CONVENIO = "convenio"
     TRATADO = "tratado"
     AUTO_ACORDADO = "auto_acordado"
+
+    SENTENCIA = "sentencia"
+    CERTIFICADO = "certificado"
+    DICTAMEN = "dictamen"
+    AVISO = "aviso"
+    BANDO = "bando"
+    NOTIFICACION = "notificacion"
+    MENSAJE = "mensaje"
+    OTRO = "otro"
 
 
 class ChileanLegalNorm(BaseModel):
@@ -58,33 +62,27 @@ class ChileanLegalNorm(BaseModel):
     domain terminology where translation would lose legal precision.
     """
 
-    # Identifiers
     norm_id: int = Field(..., gt=0, description="BCN database ID")
 
-    # Core metadata
     norm_type: NormType = Field(..., description="Type of legal instrument")
     norm_number: str = Field(..., min_length=1, description="Official norm number")
     title: str = Field(..., min_length=10, max_length=500)
 
-    # Dates
     publication_date: date = Field(..., description="Official publication date (Diario Oficial)")
     promulgation_date: Optional[date] = Field(
         None, description="Date when signed into law"
     )
     last_modified: Optional[date] = Field(None, description="Last amendment date")
 
-    # Issuing authority
     issuing_body: str = Field(
         ..., min_length=5, description="Government entity that issued the norm"
     )
     version: Optional[str] = Field(None, description="Current version identifier")
 
-    # Classification
     subject_tags: List[str] = Field(
         default_factory=list, description="Legal subject matter tags"
     )
 
-    # URLs
     official_url: HttpUrl = Field(..., description="Canonical BCN URL")
 
     # Content (⭐ critical fields for RAG)

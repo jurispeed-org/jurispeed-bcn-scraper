@@ -1,107 +1,100 @@
-# 📜 Jurispeed BCN Legal Scraper
+# Jurispeed BCN Legal Scraper
 
-Production-ready scraper for Chilean legal norms from BCN (Biblioteca del Congreso Nacional).
+Production scraper for Chilean legal norms from BCN (Biblioteca del Congreso Nacional). Scrapes ~411K legal documents using XML-only pipeline with semantic chunking and AWS storage.
 
-## 🎯 Features
+## Overview
 
-- ✅ **Playwright-based scraping** - Handles JavaScript SPA rendering
-- ✅ **Checkpoint system** - Resume from last processed ID (DynamoDB)
-- ✅ **S3 storage** - Immediate upload of scraped documents
-- ✅ **Multi-instance support** - Divide 300K docs across 5 EC2 instances
-- ✅ **Retry logic** - 3 attempts with exponential backoff
-- ✅ **Rate limiting** - 2.5s delay to avoid bans
-- ✅ **CloudWatch Logs** - Production monitoring
-- ✅ **Structured logging** - JSON format for parsing
+This scraper fetches legal documents from Chile's Congressional Library (BCN), processes them into semantically meaningful chunks, and stores them in S3 for downstream indexing. Built for production deployment across 8 EC2 instances in AWS.
 
-### Indexing (Professional Pipeline)
-- ✅ **Semantic chunking** (by meaning, not arbitrary bytes)
-- ✅ **Token-aware** (512 tokens optimal for Cohere v4)
-- ✅ **Context preservation** (50 token overlap)
-- ✅ **Article detection** (legal text specific)
-- ✅ **Direct Bedrock integration** (Cohere Embed v4, 512 dims)
-- ✅ **Bulk OpenSearch indexing** (batch operations)
-- ✅ **S3 document storage** (originals backup)
+**Key Features:**
+- XML-only pipeline (no HTML fallback - quality over coverage)
+- Semantic chunking with article-aware parsing
+- Exponential backoff with retry logic
+- S3 storage with immediate upload
+- DynamoDB checkpoint system for resume capability
 
-### Quality
-- ✅ **Zero legacy code dependencies**
-- ✅ **Structured logging** (JSON format for CloudWatch)
-- ✅ **Production-ready** (type hints, error handling)
-- ✅ **Following RAG best practices**
+## How It Works
 
-## Architecture
+### 1. Scraping Pipeline
+
+Processes legal documents from BCN in 5 stages:
+
+1. **Fetch XML** - Downloads document from BCN's official XML endpoint (`obtxml` service)
+2. **Parse Metadata** - Extracts norm type, number, dates, issuing body, and article hierarchy
+3. **Parse Content** - Identifies article structure, numerals, letters, and vigencia status (in-force/repealed)
+4. **Chunk Semantically** - Splits articles into 512-token chunks while preserving legal structure and context
+5. **Upload to S3** - Stores complete document with metadata and chunks as JSON
+
+**Why XML-only?** BCN's XML is schema-defined with reliable metadata (vigencia, article IDs). This gives us 98%+ vigencia coverage for free, whereas HTML scraping would require separate requests and parsing.
+
+### 2. Indexing Pipeline
+
+Once scraping completes, the indexing pipeline processes the stored documents:
+
+1. **Read from S3** - Loads chunked JSON documents
+2. **Generate Embeddings** - Creates vector embeddings using AWS Bedrock (Cohere Embed v4, 512 dimensions)
+3. **Batch Intelligently** - Groups chunks into optimized batches (respects Bedrock limits)
+4. **Index to OpenSearch** - Stores chunks with embeddings for semantic search
+
+Both pipelines are included in this repository.
+
+## Directory Structure
 
 ```
 jurispeed-bcn-scraper/
 ├── src/
-│   ├── __init__.py
-│   ├── cli.py                       # CLI interface
-│   ├── core/                        # Core scraping logic
-│   │   ├── __init__.py
-│   │   ├── models.py                # Pydantic models (validation)
-│   │   ├── parser.py                # HTML parser
-│   │   ├── scraper.py               # Async scraper (httpx + tenacity)
-│   │   └── scraper_playwright.py    # Playwright-based scraper
-│   ├── pipeline/                    # Processing pipeline
-│   │   ├── __init__.py
-│   │   ├── chunker.py               # ⭐ Professional semantic chunker
-│   │   ├── embedder.py              # ⭐ Bedrock Cohere v4 client
-│   │   ├── indexer.py               # ⭐ Pipeline orchestrator
-│   │   └── checkpoint.py            # DynamoDB checkpoint manager
-│   ├── storage/                     # AWS storage clients
-│   │   ├── __init__.py
-│   │   ├── s3_client.py             # ⭐ S3 document storage
-│   │   └── opensearch_client.py     # ⭐ Direct OpenSearch indexing
-│   └── utils/                       # Utilities
-│       ├── __init__.py
-│       └── config.py                # Configuration management
-├── scripts/                         # Deployment scripts
-│   ├── launch_ec2.py
-│   ├── setup_aws_resources.py
-│   ├── run_scraper.py
-│   ├── run_scraper_priority.py
-│   └── run_multi_instance.py
-├── deployment/                      # AWS configuration
-│   ├── ec2_user_data.sh
-│   └── priority_norms.txt
-├── tests/                          # Test suite
-│   ├── unit/
-│   │   └── test_parser.py
-│   └── integration/
-│       └── test_scraper_integration.py
-├── docs/                           # Documentation
-│   └── AWS_RESOURCES.md
-├── pyproject.toml
+│   ├── core/
+│   │   ├── models.py           # Pydantic data models
+│   │   ├── scraper.py          # XML fetching with aiohttp
+│   │   └── xml_parser.py       # BCN XML parser
+│   ├── pipeline/
+│   │   ├── chunker.py          # Semantic chunker (512 token target)
+│   │   ├── article_parser.py   # Article substructure parser
+│   │   ├── checkpoint.py       # DynamoDB checkpoint manager
+│   │   └── norm_tracker.py     # Norm status tracking
+│   ├── storage/
+│   │   └── s3_client.py        # S3 document storage
+│   └── utils/
+│       └── config.py           # Configuration management
+├── scripts/
+│   ├── run_scraper.py          # Production scraper entry point
+│   ├── retry_failed_norms.py   # Retry failed documents
+│   └── create_norm_status_table.py
+├── tests/
+│   ├── test_scrape_to_chunks_e2e.py         # End-to-end test (33 norms)
+│   ├── test_parsing_and_chunking_validation.py
+│   ├── test_xml_pipeline.py
+│   ├── test_xml_fetching.py
+│   ├── test_smart_batching.py               # Bedrock batching
+│   ├── test_scraping_throughput.py          # Throughput benchmark
+│   └── test_deferred_effectiveness.py
+├── CLAUDE.md                   # Project instructions for Claude Code
+├── requirements.txt
 ├── .env.example
 └── README.md
 ```
 
-**⭐ = Professional pipeline (zero legacy dependencies)**
+## Setup
 
-## 📊 Scraping Stats
+### 1. Prerequisites
 
-- **Total documents:** 300,000 legal norms
-- **Time estimate:** 3-4 days with 5 EC2 instances
-- **Speed:** ~21,600 docs/day per instance
-- **Storage:** ~15GB in S3 (JSON format)
-- **Cost:** ~$18 total (EC2 + S3)
+- Python 3.11+
+- AWS credentials with access to DynamoDB and S3
+- Virtual environment (recommended)
 
-## 🚀 Quick Start
-
-### 1. Install Dependencies
+### 2. Installation
 
 ```bash
-# Create virtual environment
-python3.11 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+# Create and activate virtual environment
+python -m venv venv
+source venv/Scripts/activate  # Windows Git Bash
+source venv/bin/activate       # Linux/Mac
 
 # Install dependencies
 pip install -r requirements.txt
-
-# Install Playwright browsers
-playwright install chromium
 ```
 
-### 2. Configure Environment
+### 3. Environment Configuration
 
 ```bash
 cp .env.example .env
@@ -109,326 +102,94 @@ cp .env.example .env
 ```
 
 Required variables:
-- `AWS_ACCESS_KEY_ID` - AWS access key
-- `AWS_SECRET_ACCESS_KEY` - AWS secret key
-- `S3_BUCKET_NAME` - S3 bucket for documents
-- `CHECKPOINT_TABLE_NAME` - DynamoDB table for checkpoints
-
-### 3. Create AWS Resources
-
-**Resources needed:**
-- ✅ DynamoDB table: `jurispeed-scraper-checkpoints` (CREATED ✅)
-- ✅ S3 bucket: `jurispeed-bcn-legal-docs` (CREATED ✅)
-
-**Status:** Both resources are ready in region `us-west-2`
-
-**To verify:**
-```bash
-python setup_aws_resources.py --verify
+```env
+AWS_ACCESS_KEY_ID=your_key
+AWS_SECRET_ACCESS_KEY=your_secret
+AWS_REGION=us-west-2
+S3_BUCKET_NAME=jurispeed-bcn-legal-docs
 ```
 
-**Resource details:**
-```
-DynamoDB Table: jurispeed-scraper-checkpoints
-├── Region: us-west-2
-├── Billing: Pay-per-request (no provisioned capacity)
-├── Primary Key: instance_id (String)
-└── Status: ACTIVE ✅
-
-S3 Bucket: jurispeed-bcn-legal-docs
-├── Region: us-west-2
-├── Versioning: Enabled
-├── Path structure: {knowledge_id}/originals/{doc_id}.json
-└── Status: ACTIVE ✅
-```
-
-## Usage
-
-### Dry Run (scrape without uploading)
+## Running Tests
 
 ```bash
-python -m src.cli \
-  --instance-id test-local \
-  --range-start 1 \
-  --range-end 100 \
-  --dry-run
-```
+# Activate virtual environment
+source venv/Scripts/activate  # Windows
+source venv/bin/activate       # Linux/Mac
 
-### Production Run
+# Run end-to-end test (33 diverse norms)
+pytest tests/test_scrape_to_chunks_e2e.py -v
 
-```bash
-# Using CLI directly
-python -m cli \
-  --instance-id scraper-1 \
-  --range-start 1 \
-  --range-end 60000
-
-# Or using script
-python scripts/run_scraper.py \
-  --start 1 \
-  --end 60000 \
-  --instance-id scraper-1
-```
-
-### Resume from Checkpoint
-
-```bash
-python scripts/run_scraper.py \
-  --resume \
-  --instance-id scraper-1
-```
-
-## Multi-Instance Deployment (EC2)
-
-Deploy 5 instances in parallel using the launch script:
-
-```bash
-# Launch EC2 instances (automated)
-python scripts/launch_ec2.py --instance-num 1
-python scripts/launch_ec2.py --instance-num 2
-python scripts/launch_ec2.py --instance-num 3
-python scripts/launch_ec2.py --instance-num 4
-python scripts/launch_ec2.py --instance-num 5
-```
-
-Or manually run on each instance:
-
-```bash
-# Instance 1
-python scripts/run_scraper.py --start 1 --end 60000 --instance-id ec2-instance-1
-
-# Instance 2
-python scripts/run_scraper.py --start 60001 --end 120000 --instance-id ec2-instance-2
-
-# ... etc
-```
-
-**Expected throughput:** ~900 docs/hour per instance = 4,500 docs/hour total
-
-## Configuration
-
-Edit `.env` file:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AWS_ACCESS_KEY_ID` | AWS credentials | - |
-| `CHECKPOINT_TABLE_NAME` | DynamoDB table for checkpoints | `jurispeed-scraper-checkpoints` |
-| `LEXINTEL_API_URL` | Lexintel backend URL | - |
-| `KNOWLEDGE_ID` | Target knowledge base | `normativabcn` |
-| `RATE_LIMIT_SECONDS` | Delay between requests | `2.5` |
-| `CHECKPOINT_EVERY` | Save checkpoint every N docs | `1000` |
-
-## Data Model
-
-### Extracted Fields (10 + 2 critical)
-
-```python
-{
-  "norm_id": 12345,                          # BCN ID
-  "norm_type": "ley",                        # ley, codigo, dfl, decreto, reglamento
-  "norm_number": "19846",
-  "title": "LEY NUM. 19.846 SUBSIDIO HABITACIONAL",
-  "publication_date": "2003-01-04",
-  "promulgation_date": "2002-12-27",
-  "last_modified": "2024-05-15",
-  "issuing_body": "MINISTERIO DE VIVIENDA Y URBANISMO",
-  "version": "2025-09-29",
-  "subject_tags": ["vivienda", "subsidios"],
-  "official_url": "https://bcn.cl/leychile/navegar?idNorma=12345",
-  
-  # ⭐ Critical fields for RAG
-  "summary": "Establece normas sobre subsidio habitacional...",
-  "full_content": "Artículo 1°. El presente decreto..."
-}
-```
-
-## 🧪 Testing
-
-### Run Tests
-
-```bash
-# Run parser tests
-pytest tests/unit/test_parser.py -v
-
-# Run integration test (scrapes 3 real docs)
-pytest tests/integration/test_scraper_integration.py -v
+# Run XML pipeline validation
+pytest tests/test_xml_pipeline.py -v
 
 # Run all tests
 pytest tests/ -v
 ```
 
-### Verify AWS Resources
+## AWS Resources
+
+### Required Resources (us-west-2)
+
+**DynamoDB Tables:**
+- `jurispeed-scraper-checkpoints` - Progress tracking per instance
+- `jurispeed-norm-status` - Individual norm status for retry logic (GSI: status-index)
+
+**S3 Bucket:**
+- `jurispeed-bcn-legal-docs`
+- Path: `normativabcn/originals/bcn-{norm_id}.json`
+
+**IAM Role:**
+- `jurispeed-scraper-ec2-role` - EC2 instance role with S3 + DynamoDB access
+
+### Verify Resources
 
 ```bash
-# Check DynamoDB table and S3 bucket
-python setup_aws_resources.py --verify
+# Check DynamoDB tables
+aws dynamodb describe-table --table-name jurispeed-scraper-checkpoints --region us-west-2
+aws dynamodb describe-table --table-name jurispeed-norm-status --region us-west-2
 
-# Expected output:
-# ✅ DynamoDB table: jurispeed-scraper-checkpoints (Status: ACTIVE)
-# ✅ S3 bucket: jurispeed-bcn-legal-docs (accessible)
+# Check S3 bucket
+aws s3 ls s3://jurispeed-bcn-legal-docs/normativabcn/originals/ --region us-west-2
+
+# Count scraped documents
+aws s3 ls s3://jurispeed-bcn-legal-docs/normativabcn/originals/ --region us-west-2 | wc -l
 ```
 
-### Test Scraper Locally (100 docs)
+## Output Format
 
-```bash
-# Test with small range
-python run_scraper.py \
-  --start 1 \
-  --end 100 \
-  --instance-id local-test \
-  --s3-bucket jurispeed-bcn-legal-docs
-
-# Check S3 after completion
-aws s3 ls s3://jurispeed-bcn-legal-docs/normativabcn/originals/ | wc -l
-# Should show ~100 files
-```
-
-## Monitoring
-
-Logs are JSON-formatted for CloudWatch:
+Each scraped document is stored as JSON in S3 with 16 fields:
 
 ```json
 {
-  "event": "norm_parsed",
-  "norm_id": 12345,
-  "norm_type": "ley",
-  "timestamp": "2026-08-04T12:00:00Z"
+  "norm_id": 242302,
+  "norm_type": "decreto",
+  "norm_number": "100",
+  "formal_citation": "Decreto 100",
+  "title": "Constitución Política de la República de Chile",
+  "publication_date": "2005-09-22",
+  "last_modified": "2024-08-29",
+  "official_url": "https://bcn.cl/leychile/navegar?idNorma=242302",
+  "scraped_at": "2026-08-24T12:00:00",
+  "source": "xml",
+  "full_content": "...",
+  "total_chunks": 156,
+  "total_articles": 129,
+  "vigentes": 127,
+  "chunks": [
+    {
+      "chunk_index": 0,
+      "article_number": 1,
+      "formal_citation": "Decreto 100, artículo 1",
+      "vigente": true,
+      "token_count": 487,
+      "content": "...",
+      "metadata": { ... }
+    }
+  ]
 }
 ```
 
-Query in CloudWatch Insights:
-```
-fields @timestamp, norm_id, norm_type, event
-| filter event = "norm_parsed"
-| stats count() by norm_type
-```
-
-## Troubleshooting
-
-### Script stops mid-run
-
-**Solution:** Use `--resume` flag to continue from last checkpoint.
-
-### Too many 404s
-
-**Cause:** BCN ID range has gaps (not all IDs exist).
-**Expected:** ~10-15% 404 rate is normal.
-
-### Rate limiting / IP ban
-
-**Cause:** Scraping too fast.
-**Solution:** Increase `RATE_LIMIT_SECONDS` in `.env`.
-
-## Architecture Decisions
-
-### Why async + rate limiting?
-
-- Async allows efficient I/O without blocking
-- Rate limiting prevents IP bans
-- Balance: fast enough (~900 docs/h) but respectful
-
-### Why Pydantic?
-
-- Automatic validation (catches bad data early)
-- Type safety (mypy can verify)
-- Easy serialization (`.dict()`, `.json()`)
-- Self-documenting (JSON Schema generation)
-
-### Why checkpoint every 1000 docs?
-
-- Balance between safety and DynamoDB costs
-- ~$0.001 per checkpoint write
-- 300K docs = 300 checkpoints = ~$0.30 total
-
-## Cost Estimation (7 days, 5 EC2 instances)
-
-| Resource | Cost |
-|----------|------|
-| 5× EC2 t4g.small | ~$141 |
-| DynamoDB checkpoints | ~$0.30 |
-| S3 storage (50GB) | ~$1.15 |
-| Data transfer | ~$20 |
-| **Total** | **~$162** |
-
-## 📦 AWS Resources Created
-
-### ✅ Resources Status (as of 2026-08-05)
-
-| Resource | Name | Region | Status | Details |
-|----------|------|--------|--------|---------|
-| **DynamoDB** | `jurispeed-scraper-checkpoints` | us-west-2 | ✅ ACTIVE | Pay-per-request billing |
-| **S3 Bucket** | `jurispeed-bcn-legal-docs` | us-west-2 | ✅ ACTIVE | Versioning enabled |
-
-### DynamoDB Table Schema
-
-```
-Table: jurispeed-scraper-checkpoints
-├── Primary Key: instance_id (String)
-├── Attributes:
-│   ├── instance_id: "ec2-instance-1"
-│   ├── last_id_processed: 5000
-│   ├── total_processed: 5000
-│   ├── success_count: 4800
-│   ├── failed_count: 100
-│   ├── skipped_count: 100
-│   ├── retry_count: 150
-│   ├── timestamp: "2026-08-05T12:00:00Z"
-│   └── status: "running" | "completed" | "failed"
-├── Billing: Pay-per-request (no capacity planning)
-└── Estimated cost: ~$0.30 for 300K checkpoints
-```
-
-### S3 Bucket Structure
-
-```
-s3://jurispeed-bcn-legal-docs/
-└── normativabcn/
-    └── originals/
-        ├── bcn-1.json
-        ├── bcn-2.json
-        ├── bcn-19846.json
-        └── ... (300,000 total)
-```
-
-**Each JSON file contains:**
-- All 12 extracted fields (norm_id, type, title, dates, etc.)
-- Full legal content
-- Metadata (instance_id, source)
-- Average size: ~15KB per file
-
-### Verification Commands
-
-```bash
-# Check DynamoDB table
-aws dynamodb describe-table \
-  --table-name jurispeed-scraper-checkpoints \
-  --region us-west-2
-
-# Check S3 bucket
-aws s3 ls s3://jurispeed-bcn-legal-docs/
-
-# Count documents in S3
-aws s3 ls s3://jurispeed-bcn-legal-docs/normativabcn/originals/ \
-  --recursive --summarize | grep "Total Objects"
-```
-
 ---
 
-## 📝 Next Steps
-
-After scraping completes (3-4 days):
-
-1. ✅ **Verify S3 storage** (~300K files in bucket)
-2. ⏳ **Run indexing pipeline** (Feature 1.2 - coming next)
-3. ⏳ **Update MCP server** with new search tools
-4. ⏳ **Test search** in Claude Desktop
-
----
-
-## 📄 License
-
-Internal Jurispeed project - Not for public distribution.
-
-## 👤 Author
-
-Jurispeed Team - 2026
+**License:** Internal Jurispeed project  
+**Author:** Jurispeed Team - 2026

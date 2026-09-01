@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Test script to measure 404 vs valid document scraping speed.
+Benchmark scraping speed for valid documents vs 404s.
 
-Tests a small sample to estimate real throughput.
+Measures throughput and extrapolates total scraping time for 2M IDs.
+Useful for optimizing rate limiting and instance allocation.
 """
 
 import asyncio

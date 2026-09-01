@@ -36,12 +36,13 @@ class ArticleSubstructureParser:
     """
 
     def __init__(self):
-        # Patterns for numerales (Hallazgo #5 fix: ampliado para detectar más formatos)
+        # Patterns for numerales (expanded to detect more formats)
         # ORDER MATTERS: more specific patterns first
         self.numeral_patterns = [
             r'^\s*(\d+)\.-\s+',  # "1.- texto" (with hyphen - common in Chilean law)
-            r'^\s*(\d+)\.°\s+',  # "1.° texto" (masculine degree symbol)
-            r'^\s*(\d+)\.ª\s+',  # "1.ª texto" (feminine degree symbol)
+            r'^\s*(\d+)\.º\s+',  # "1.º texto" (MASCULINE ORDINAL - BCN uses this)
+            r'^\s*(\d+)\.°\s+',  # "1.° texto" (degree symbol - alternate)
+            r'^\s*(\d+)\.ª\s+',  # "1.ª texto" (feminine ordinal)
             r'^\s*(\d+)\.\s+',   # "1. texto" (simple dot)
             r'^\s*(\d+)\)\s+',   # "1) texto" (parenthesis)
             r'^\s*N°\s*(\d+)[\.:\-]?\s+',  # "N°1:" or "N° 1."
@@ -49,16 +50,18 @@ class ArticleSubstructureParser:
         ]
 
         # Inline numeral patterns (for cases like "...y 3.- texto")
-        # These detect numerals NOT at line start (Hallazgo #5: Art 365 bis case)
+        # These detect numerals NOT at line start
         self.inline_numeral_patterns = [
-            r'\s+y\s+(\d+)\.-\s+',  # "y 3.- texto" (inline after "y")
-            r'\s+y\s+(\d+)\.°\s+',  # "y 3.° texto"
-            r'\s+y\s+(\d+)\.ª\s+',  # "y 3.ª texto"
+            r'\s+y\s+(\d+)\.-\s+',   # "y 3.- texto" (inline after "y")
+            r'\s+y\s+(\d+)\.º\s+',   # "y 3.º texto" (MASCULINE ORDINAL)
+            r'\s+y\s+(\d+)\.°\s+',   # "y 3.° texto" (degree symbol)
+            r'\s+y\s+(\d+)\.ª\s+',   # "y 3.ª texto" (feminine ordinal)
             r',\s*y\s+(\d+)\.-\s+',  # ", y 3.- texto" (with comma)
+            r',\s*y\s+(\d+)\.º\s+',  # ", y 3.º texto" (with comma, ORDINAL)
         ]
 
         # Patterns for letras
-        self.letra_patterns = [
+        self.letter_patterns = [
             r'^\s*([a-z])\)\s+',  # "a) texto"
             r'^\s*letra\s+([a-z])\)',  # "letra a) texto"
         ]
@@ -88,7 +91,7 @@ class ArticleSubstructureParser:
             return []
 
         # Check if article has explicit structure (numerales or letras)
-        has_structure = self._has_numerales_or_letras(article_text)
+        has_structure = self._has_numerals_or_letters(article_text)
 
         if not has_structure:
             # No explicit structure: return empty list
@@ -106,7 +109,7 @@ class ArticleSubstructureParser:
 
         return subparts
 
-    def _has_numerales_or_letras(self, text: str) -> bool:
+    def _has_numerals_or_letters(self, text: str) -> bool:
         """Check if text contains numeral or letra markers (both line-start and inline)."""
         lines = text.split('\n')
 
@@ -116,13 +119,13 @@ class ArticleSubstructureParser:
                 if re.match(pattern, line, re.IGNORECASE):
                     return True
 
-            # Check inline numerales (Hallazgo #5: "y 3.-" cases)
+            # Check inline numerales (e.g., "y 3.-" cases)
             for pattern in self.inline_numeral_patterns:
                 if re.search(pattern, line, re.IGNORECASE):
                     return True
 
             # Check letras
-            for pattern in self.letra_patterns:
+            for pattern in self.letter_patterns:
                 if re.match(pattern, line, re.IGNORECASE):
                     return True
 
@@ -162,13 +165,11 @@ class ArticleSubstructureParser:
             # Check if this line starts a new numeral
             numeral_match = self._match_numeral(line)
             if numeral_match:
-                # Save previous subpart
                 if current_subpart:
                     current_subpart.text = '\n'.join(current_text_lines).strip()
                     subparts.append(current_subpart)
                     current_text_lines = []
 
-                # Start new numeral
                 current_subpart = SubPart(
                     type="numeral",
                     number=numeral_match['number'],
@@ -183,39 +184,32 @@ class ArticleSubstructureParser:
                     current_text_lines = [numeral_match['remaining_text']]
                 continue
 
-            # Check if this line starts a new letra
-            letra_match = self._match_letra(line)
-            if letra_match:
-                # Save previous subpart
+            letter_match = self._match_letter(line)
+            if letter_match:
                 if current_subpart:
                     current_subpart.text = '\n'.join(current_text_lines).strip()
                     subparts.append(current_subpart)
                     current_text_lines = []
 
-                # Start new letra
                 current_subpart = SubPart(
                     type="letra",
-                    letter=letra_match['letter'],
+                    letter=letter_match['letter'],
                     start_pos=base_pos
                 )
 
                 # If this is the first subpart, prepend preamble
                 if preamble_lines:
-                    current_text_lines = preamble_lines + [letra_match['remaining_text']]
+                    current_text_lines = preamble_lines + [letter_match['remaining_text']]
                     preamble_lines = []
                 else:
-                    current_text_lines = [letra_match['remaining_text']]
+                    current_text_lines = [letter_match['remaining_text']]
                 continue
 
-            # Regular line
             if current_subpart:
-                # Already in a subpart: add line to it
                 current_text_lines.append(line)
             else:
-                # Before first numeral/letra: accumulate as preamble
                 preamble_lines.append(line)
 
-        # Save last subpart
         if current_subpart:
             current_subpart.text = '\n'.join(current_text_lines).strip()
             subparts.append(current_subpart)
@@ -227,16 +221,27 @@ class ArticleSubstructureParser:
         Check if line starts with a numeral marker.
 
         Returns:
-            Dict with 'number' and 'remaining_text', or None
+            Dict with 'number', 'mark' (literal), and 'remaining_text', or None
         """
-        # First check line-start patterns
         for pattern in self.numeral_patterns:
             match = re.match(pattern, line, re.IGNORECASE)
             if match:
                 number = int(match.group(1))
                 remaining_text = line[match.end():].strip()
+                # Preserve literal mark from text
+                mark_literal = match.group(0).strip()  # "1.º " -> "1.º"
+
+                # FILTER: Ignore "N° X D.O." patterns (editorial marginal notes)
+                # These are not subdivisions, they're references to Diario Oficial
+                if 'N°' in mark_literal or 'Nº' in mark_literal:
+                    # Check if remaining text starts with "D.O." (Diario Oficial)
+                    if remaining_text.startswith('D.O.') or remaining_text.startswith('D O'):
+                        # This is a marginal note, not a subdivision
+                        continue
+
                 return {
                     'number': number,
+                    'mark': mark_literal,
                     'remaining_text': remaining_text
                 }
 
@@ -320,30 +325,31 @@ class ArticleSubstructureParser:
                         break
 
                 if not has_more_inline:
-                    # No more inline numerals, add this line and stop
                     result.append(numeral_line)
                     break
             else:
-                # No more inline numerals
                 result.append(remaining)
                 break
 
         return result if result else [line]
 
-    def _match_letra(self, line: str) -> Optional[Dict]:
+    def _match_letter(self, line: str) -> Optional[Dict]:
         """
         Check if line starts with a letra marker.
 
         Returns:
-            Dict with 'letter' and 'remaining_text', or None
+            Dict with 'letter', 'mark' (literal), and 'remaining_text', or None
         """
-        for pattern in self.letra_patterns:
+        for pattern in self.letter_patterns:
             match = re.match(pattern, line, re.IGNORECASE)
             if match:
                 letter = match.group(1)
                 remaining_text = line[match.end():].strip()
+                # Preserve literal mark from text
+                mark_literal = match.group(0).strip()  # "a) " -> "a)"
                 return {
                     'letter': letter,
+                    'mark': mark_literal,
                     'remaining_text': remaining_text
                 }
 
@@ -429,7 +435,7 @@ def extract_subdivisions_metadata(article_text: str) -> List[Dict]:
     parser = ArticleSubstructureParser()
 
     # Check if article has explicit structure
-    has_structure = parser._has_numerales_or_letras(article_text)
+    has_structure = parser._has_numerals_or_letters(article_text)
     if not has_structure:
         return []
 
@@ -442,22 +448,22 @@ def extract_subdivisions_metadata(article_text: str) -> List[Dict]:
         # Check for numeral
         numeral_match = parser._match_numeral(line)
         if numeral_match:
-            # Found start of a subdivision
-            # We'll need to find where it ends (next subdivision or end of text)
+            # Use literal mark from text, not reconstructed
             subdivisions.append({
                 "type": "numeral",
-                "mark": f"{numeral_match['number']}.-",
+                "mark": numeral_match['mark'],  # "1.º" as it appears in XML
                 "number": numeral_match['number'],
                 "start": current_pos
             })
 
         # Check for letra
-        letra_match = parser._match_letra(line)
-        if letra_match:
+        letter_match = parser._match_letter(line)
+        if letter_match:
+            # Use literal mark from text, not reconstructed
             subdivisions.append({
                 "type": "letra",
-                "mark": f"{letra_match['letter']})",
-                "letter": letra_match['letter'],
+                "mark": letter_match['mark'],  # "a)" as it appears in XML
+                "letter": letter_match['letter'],
                 "start": current_pos
             })
 
@@ -508,7 +514,6 @@ def _find_subdivision_end(text: str, start_pos: int) -> int:
     # Search for newline + indent pattern
     # This pattern matches: \n followed by 5+ spaces, followed by uppercase letter or "En caso"
     # (common patterns for article-level incisos)
-    import re
     indent_pattern = r'\n {5,}[A-ZÁ]'  # Newline + 5+ spaces + uppercase letter
     match = re.search(indent_pattern, text[search_start:])
     indent_break = match.start() + search_start if match else -1

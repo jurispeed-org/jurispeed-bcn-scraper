@@ -15,6 +15,8 @@ Usage:
 
 import asyncio
 import argparse
+import os
+import re
 import structlog
 import sys
 from pathlib import Path
@@ -70,7 +72,6 @@ class ProductionScraper:
         self.instance_id = instance_id
         self.skip_ids = skip_ids or set()
 
-        # Initialize components
         self.scraper = BCNPlaywrightScraper(config.scraper)
         self.xml_parser = BCNXMLParser()
         self.chunker = ProfessionalChunker(
@@ -108,7 +109,6 @@ class ProductionScraper:
             end_id: Ending norm ID (inclusive)
         """
         try:
-            # Start browser
             await self.scraper.start()
 
             logger.info(
@@ -119,17 +119,14 @@ class ProductionScraper:
                 total_range=end_id - start_id + 1,
             )
 
-            # Scrape range
             for norm_id in range(start_id, end_id + 1):
                 # Skip if already scraped (DISABLED - starting fresh)
                 # if norm_id in self.skip_ids:
                 #     logger.debug("skipping_already_scraped", norm_id=norm_id)
                 #     continue
 
-                # Scrape one norm
                 norm = await self.scraper.scrape_one(norm_id)
 
-                # Upload to S3 if successful, or track failure
                 if norm:
                     # Fetch XML again for chunking (necessary for subestructura)
                     xml_content = await self.scraper._fetch_xml(norm_id, timeout=30)
@@ -139,11 +136,9 @@ class ProductionScraper:
 
                     await self._store_norm(norm, xml_content)
                 else:
-                    # Track failed norm for retry logic
                     error_reason = self.scraper.last_error or "Unknown error"
                     self.norm_tracker.mark_failed(norm_id, error_reason)
 
-                # Checkpoint every N docs
                 if (norm_id - start_id + 1) % self.config.scraper.checkpoint_every == 0:
                     stats = self.scraper.get_stats()
                     self.checkpoint_mgr.save(norm_id, stats)
@@ -159,7 +154,6 @@ class ProductionScraper:
                         success_rate=f"{stats.success_rate:.1f}%",
                     )
 
-            # Mark as completed
             final_stats = self.scraper.get_stats()
             self.checkpoint_mgr.mark_completed(final_stats)
 
@@ -172,7 +166,6 @@ class ProductionScraper:
 
         except KeyboardInterrupt:
             logger.warning("scraping_interrupted_by_user", instance_id=self.instance_id)
-            # Save checkpoint before exiting
             stats = self.scraper.get_stats()
             self.checkpoint_mgr.save(norm_id, stats)
             raise
@@ -188,7 +181,6 @@ class ProductionScraper:
             raise
 
         finally:
-            # Cleanup
             await self.scraper.close()
 
     async def process_norm_data(self, norm: ChileanLegalNorm, xml_content: str = None) -> dict:
@@ -202,7 +194,6 @@ class ProductionScraper:
         Returns:
             Complete data dict with chunks ready for storage
         """
-        # Extract hierarchy and chunk
         chunks = []
         total_articles = 0
         vigentes = 0
@@ -216,13 +207,18 @@ class ProductionScraper:
                 total_articles = len(hierarchy)
                 vigentes = sum(1 for info in hierarchy.values() if info.get('in_force', True))
 
+                # Extract global in_force status
+                norm_in_force = self.xml_parser.extract_norm_vigencia(xml_content)
+
                 # Chunk with XML data
                 metadata = {
                     "norm_id": norm.norm_id,
                     "norm_type": norm.norm_type.value if hasattr(norm.norm_type, 'value') else norm.norm_type,
                     "norm_number": norm.norm_number,
                     "norm_title": norm.title,
-                    "official_url": str(norm.official_url)
+                    "official_url": str(norm.official_url),
+                    "norm_citation": norm.formal_citation,
+                    "in_force": norm_in_force,
                 }
 
                 chunks = self.chunker.chunk(
@@ -248,7 +244,6 @@ class ProductionScraper:
                     note="Falling back to raw norm only"
                 )
 
-        # Prepare document with all required fields
         data = {
             "norm_id": norm.norm_id,
             "norm_type": norm.norm_type.value if hasattr(norm.norm_type, 'value') else norm.norm_type,
@@ -264,7 +259,6 @@ class ProductionScraper:
             "full_content": norm.full_content,
         }
 
-        # Add chunking data if available
         if chunks:
             data["chunks"] = [
                 {
@@ -295,9 +289,6 @@ class ProductionScraper:
             norm: The current norm being processed
             xml_content: Raw XML content
         """
-        import re
-
-        # Check if this is a texto refundido
         title_upper = norm.title.upper()
         is_refundido = any(phrase in title_upper for phrase in [
             "TEXTO REFUNDIDO",
@@ -336,14 +327,11 @@ class ProductionScraper:
             law_numbers=law_numbers
         )
 
-        # For each law number, store in DynamoDB
         # Cleanup script will resolve law_number -> norm_id later
         for law_num in law_numbers:
-            # Clean law number (remove dots: "18.290" -> "18290")
             law_num_clean = law_num.replace(".", "")
 
             try:
-                # Store in DynamoDB with law number
                 # Cleanup script will query BCN API to get norm_id
                 self.norm_tracker.mark_refundida(
                     refundido_por=norm.norm_id,
@@ -373,10 +361,8 @@ class ProductionScraper:
             norm: Validated legal norm
             xml_content: Raw XML for chunking
         """
-        # Process norm data (same logic as tests use)
         data = await self.process_norm_data(norm, xml_content)
 
-        # Build S3 key
         doc_id = f"bcn-{norm.norm_id}"
         key = self.s3_storage.build_key(
             knowledge_id=self.config.lexintel.knowledge_id,
@@ -384,14 +370,12 @@ class ProductionScraper:
             prefix="originals",
         )
 
-        # Add S3 metadata
         metadata = {
             "instance_id": self.instance_id,
             "source": "bcn-scraper-xml",
             "has_chunks": str(data.get("total_chunks", 0) > 0).lower()
         }
 
-        # Upload
         success = self.s3_storage.store_document(key, data, metadata)
 
         if success:
@@ -504,12 +488,10 @@ async def main():
 
     args = parser.parse_args()
 
-    # Load IDs to skip
     # DISABLED: Starting fresh, no skip list
     # skip_ids = load_skip_ids(args.skip_file)
     skip_ids = set()
 
-    # Load config
     try:
         config = Config.from_env()
         config.validate_required()
@@ -517,14 +499,11 @@ async def main():
         logger.error("config_validation_failed", error=str(e))
         sys.exit(1)
 
-    # Get S3 bucket
-    import os
     s3_bucket = args.s3_bucket or os.getenv("S3_BUCKET_NAME")
     if not s3_bucket:
         logger.error("s3_bucket_required", message="Provide --s3-bucket or set S3_BUCKET_NAME env var")
         sys.exit(1)
 
-    # Initialize scraper
     scraper = ProductionScraper(
         config=config,
         instance_id=args.instance_id,
@@ -532,7 +511,6 @@ async def main():
         skip_ids=skip_ids,
     )
 
-    # Determine start point
     if args.resume:
         last_id = scraper.get_resume_point()
         if last_id:
@@ -543,7 +521,6 @@ async def main():
                 resume_from_id=start_id,
             )
         else:
-            # No checkpoint, start from beginning or user-provided start
             start_id = args.start or 1
             logger.info(
                 "no_checkpoint_starting_fresh",
@@ -551,7 +528,6 @@ async def main():
                 start_id=start_id,
             )
     else:
-        # Fresh start
         start_id = args.start or 1
         logger.info(
             "starting_fresh",
@@ -561,7 +537,6 @@ async def main():
 
     end_id = args.end
 
-    # Validate range
     if start_id > end_id:
         logger.error(
             "invalid_range",
@@ -571,7 +546,6 @@ async def main():
         )
         sys.exit(1)
 
-    # Run scraper
     try:
         await scraper.scrape_with_storage(start_id, end_id)
         logger.info("scraper_finished_successfully", instance_id=args.instance_id)

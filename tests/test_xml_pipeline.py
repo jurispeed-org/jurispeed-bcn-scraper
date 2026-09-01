@@ -233,14 +233,10 @@ async def main():
         print("SAMPLE CHUNKS")
         print("-" * 70)
 
-        for i in [0, 1, 2, len(chunks)//2, -2, -1]:
-            if i >= len(chunks) or i < -len(chunks):
-                continue
-
+        for i in [0, len(chunks)//2, -1]:
             chunk = chunks[i]
             article_num = chunk.metadata.get("article_number")
 
-            # Generate formal citation
             if article_num is not None:
                 is_nested = chunk.metadata.get("is_nested", False)
                 parent_article = chunk.metadata.get("parent_article")
@@ -253,44 +249,17 @@ async def main():
                 citation = norm.formal_citation
 
             print(f"\nChunk {chunk.chunk_index + 1}/{chunk.chunk_total}:")
-            print(f"  Formal citation: {citation}")
-            print(f"  Article number: {article_num if article_num else 'N/A'}")
-            print(f"  Vigente: {chunk.metadata.get('vigente')}")  # ✅ XML vigencia!
-
-            if chunk.metadata.get("fecha_version"):
-                print(f"  Fecha version: {chunk.metadata.get('fecha_version')}")
-
-            # Show hierarchy info
-            if chunk.metadata.get("is_nested"):
-                print(f"  Hierarchy: Nested under ARTICULO {chunk.metadata.get('parent_article')} (level {chunk.metadata.get('hierarchy_level')})")
-                print(f"  Label: {chunk.metadata.get('article_label', 'N/A')}")
-            elif chunk.metadata.get("article_number"):
-                print(f"  Hierarchy: Root level")
-
-            # Show substructure info
-            if chunk.metadata.get("substructure_type"):
-                subtype = chunk.metadata.get("substructure_type")
-                if subtype == "numeral":
-                    print(f"  Substructure: Numeral N°{chunk.metadata.get('numeral')}")
-                elif subtype == "letra":
-                    print(f"  Substructure: Letra {chunk.metadata.get('letra')})")
-                elif subtype == "inciso":
-                    print(f"  Substructure: Inciso {chunk.metadata.get('inciso')}")
-
+            print(f"  Citation: {citation}")
+            print(f"  Vigente: {chunk.metadata.get('vigente')}")
             print(f"  Tokens: {chunk.token_count}")
-            print(f"  Preview: {chunk.text[:150]}...")
+            print(f"  Preview: {chunk.text[:100]}...")
 
         print("\n" + "=" * 70)
         print("TEST COMPLETE - XML PIPELINE SUCCESSFUL")
         print("=" * 70)
-        print(f"\nKey advantages over HTML:")
-        print(f"  [+] Vigencia FREE (no additional scraping needed)")
-        print(f"  [+] idParte direct from XML attributes")
-        print(f"  [+] Less fragile (official schema)")
-        print(f"  [+] Cleaner parsing (no HTML noise)")
         print(f"\nOutputs saved:")
-        print(f"  - XML: {xml_path}")
-        print(f"  - JSON: {output_path}")
+        print(f"  XML: {xml_path}")
+        print(f"  JSON: {output_path}")
 
         return 0
 

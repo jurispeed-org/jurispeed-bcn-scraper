@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Test XML pipeline with diverse norm types.
+End-to-end test: scraping → parsing → chunking (33 diverse norms).
 
-Tests fetching, parsing, and chunking across different norm types
-to validate XML pipeline consistency.
+Validates complete processing pipeline from BCN XML to chunked JSON output.
+Does NOT upload to S3 (local validation only).
 """
 
 import asyncio
@@ -41,12 +41,7 @@ async def test_norm(
     tracker: NormTracker,
     output_dir: Path
 ) -> Optional[Dict]:
-    """
-    Test one norm using EXACT production code path.
-
-    Uses ProductionScraper.process_norm_data() to ensure test validates
-    the same logic that runs in production.
-    """
+    """Test one norm using production code path."""
     result = {
         "norm_id": norm_id,
         "status": "pending",
@@ -54,7 +49,6 @@ async def test_norm(
     }
 
     try:
-        # Use production scraper's scrape_one()
         norm = await production_scraper.scraper.scrape_one(norm_id)
 
         if not norm:
@@ -63,7 +57,6 @@ async def test_norm(
             tracker.mark_failed(norm_id, result["error"])
             return result
 
-        # Fetch XML for processing
         xml_content = await production_scraper.scraper._fetch_xml(norm_id, timeout=30)
 
         if xml_content:
@@ -73,7 +66,6 @@ async def test_norm(
             with open(xml_path, "w", encoding="utf-8") as f:
                 f.write(xml_content)
 
-        # Use PRODUCTION CODE to process norm data
         data = await production_scraper.process_norm_data(norm, xml_content)
 
         # Extract stats for result
@@ -116,7 +108,6 @@ async def test_norm(
             json.dump(data, f, indent=2, ensure_ascii=False)
         result["json_file"] = f"chunks/norm_{norm_id}_chunks.json"
 
-        # Mark as success in DynamoDB
         tracker.mark_success(
             norm_id=norm_id,
             source="xml",
@@ -136,20 +127,15 @@ async def main():
     print("\n" + "=" * 80)
     print("TESTING XML-ONLY PIPELINE WITH DIVERSE NORMS")
     print("=" * 80)
-    print(f"Strategy: XML only (no HTML fallback)")
-    print(f"Retries: 7 attempts with exponential backoff + jitter")
-    print(f"Timeout: 30s -> 60s (progressive)")
-    print(f"Total norms to test: {len(TEST_NORM_IDS)}")
-    print(f"Code path: PRODUCTION (using ProductionScraper)")
+    print(f"Total norms: {len(TEST_NORM_IDS)}")
+    print(f"Code path: ProductionScraper")
     print()
 
-    # Create output directory
     output_dir = Path(__file__).parent / "test_diverse_output"
     output_dir.mkdir(exist_ok=True)
     print(f"Output directory: {output_dir}")
     print()
 
-    # Initialize components - use ProductionScraper for production code path
     config = Config.from_env()
     production_scraper = ProductionScraper(
         config=config,
@@ -159,8 +145,7 @@ async def main():
     )
     tracker = NormTracker(config.aws)
 
-    # Mark all norms as pending in DynamoDB
-    print("Initializing norm tracking in DynamoDB...")
+    print("Initializing DynamoDB tracking...")
     tracker.mark_pending(TEST_NORM_IDS)
     print()
 

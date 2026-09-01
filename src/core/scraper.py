@@ -71,7 +71,6 @@ class BCNPlaywrightScraper:
         Returns:
             Timeout in seconds
         """
-        # Increase timeout by 15 seconds per attempt
         timeout = self.config.timeout_seconds + (attempt * 15)
         return min(timeout, self.config.max_timeout_seconds)
 
@@ -97,18 +96,14 @@ class BCNPlaywrightScraper:
         Returns:
             True if should retry
         """
-        # Retryable status codes
         retryable_codes = {408, 429, 500, 502, 503, 504}
-
         if status_code and status_code in retryable_codes:
             return True
 
-        # Non-retryable status codes
         permanent_codes = {400, 401, 403, 404, 405, 410}
         if status_code and status_code in permanent_codes:
             return False
 
-        # Timeout errors are retryable
         if isinstance(error, asyncio.TimeoutError):
             return True
 
@@ -151,7 +146,6 @@ class BCNPlaywrightScraper:
 
             async with aiohttp.ClientSession(timeout=timeout_config) as session:
                 async with session.get(url, headers=headers) as response:
-                    # Check status
                     if response.status == 401:
                         logger.warning("xml_unauthorized", norm_id=norm_id)
                         return None
@@ -164,10 +158,8 @@ class BCNPlaywrightScraper:
                         logger.warning("xml_http_error", norm_id=norm_id, status=response.status)
                         return None
 
-                    # Get XML content
                     xml_content = await response.text()
 
-                    # Validate it's actually XML
                     if not xml_content.strip().startswith('<?xml'):
                         logger.warning("not_xml_response", norm_id=norm_id, preview=xml_content[:200])
                         return None
@@ -215,14 +207,12 @@ class BCNPlaywrightScraper:
         logger.debug("attempting_xml_only", norm_id=norm_id, max_attempts=max_retries)
 
         for attempt in range(max_retries):
-            # Progressive timeout
             timeout = self._calculate_timeout(attempt)
 
             try:
                 xml = await self._fetch_xml(norm_id, timeout=timeout)
 
                 if xml:
-                    # Parse XML
                     norm = self.xml_parser.parse(xml, norm_id)
                     if norm:
                         logger.info(
@@ -248,9 +238,7 @@ class BCNPlaywrightScraper:
                     error=last_error
                 )
 
-            # Retry logic
             if attempt < max_retries - 1 and norm is None:
-                # Calculate backoff with full jitter
                 wait_time = self._calculate_backoff(attempt)
 
                 logger.info(
@@ -264,7 +252,6 @@ class BCNPlaywrightScraper:
 
                 await asyncio.sleep(wait_time)
 
-        # Final check
         if norm is None:
             logger.error(
                 "scrape_failed_xml_only",
@@ -290,7 +277,6 @@ class BCNPlaywrightScraper:
             self.stats.total_processed += 1
             return None
 
-        # Success
         self.stats.success_count += 1
         self.stats.total_processed += 1
 
@@ -331,7 +317,6 @@ class BCNPlaywrightScraper:
             if norm:
                 results.append(norm)
 
-            # Checkpoint callback
             if (norm_id - start + 1) % checkpoint_freq == 0:
                 progress_pct = ((norm_id - start + 1) / (end - start + 1)) * 100
 

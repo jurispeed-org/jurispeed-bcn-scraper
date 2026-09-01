@@ -57,9 +57,9 @@ def test_batching_limits():
             total_tokens = sum(batcher.estimate_tokens(text) for text in batch)
             assert total_tokens <= 100_000, f"Batch {i} exceeds 100K tokens"
 
-        print(f"  ✅ All batches within limits")
+        print(f"  [OK] All batches within limits")
 
-    print("\n✅ TEST 1 PASSED\n")
+    print("\n[PASSED] TEST 1\n")
 
 
 def test_embedding_quality(embedder: BedrockEmbedder):
@@ -89,13 +89,13 @@ def test_embedding_quality(embedder: BedrockEmbedder):
             differences.append((i, diff))
 
     if not differences:
-        print("✅ Embeddings are IDENTICAL")
+        print("[OK] Embeddings are IDENTICAL")
     else:
-        print(f"⚠️  Found {len(differences)} differences:")
+        print(f"[WARNING] Found {len(differences)} differences:")
         for idx, diff in differences[:5]:  # Show first 5
             print(f"   Position {idx}: diff = {diff}")
 
-    print("\n✅ TEST 2 PASSED\n")
+    print("\n[PASSED] TEST 2\n")
 
 
 def test_throughput_comparison(embedder: BedrockEmbedder):
@@ -158,7 +158,7 @@ def test_throughput_comparison(embedder: BedrockEmbedder):
     print(f"  Batch-4:          {requests_batch_4:3d} requests, {time_batch_4:6.2f}s ({time_no_batch/time_batch_4:.1f}x)")
     print(f"  Smart batching:   {len(batches):3d} requests, {time_smart:6.2f}s ({time_no_batch/time_smart:.1f}x)")
 
-    print("\n✅ TEST 3 PASSED\n")
+    print("\n[PASSED] TEST 3\n")
 
 
 def main():
@@ -190,7 +190,7 @@ def main():
     test_throughput_comparison(embedder)
 
     print("=" * 70)
-    print("ALL TESTS PASSED ✅")
+    print("ALL TESTS PASSED")
     print("=" * 70)
     print()
 
