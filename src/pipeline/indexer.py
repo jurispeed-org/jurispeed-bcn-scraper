@@ -41,7 +41,7 @@ class ProductionIndexer:
         # Initialize embedder
         self.embedder = BedrockEmbedder(
             region=config.aws.region,
-            model_id="cohere.embed-v4:0",
+            model_id="global.cohere.embed-v4:0",
             dimensions=512,
             input_type="search_document",
         )
@@ -55,7 +55,7 @@ class ProductionIndexer:
 
         self.opensearch = OpenSearchIndexer(
             host=opensearch_host,
-            region=config.aws.region,
+            region=config.lexintel.opensearch_region,
             index_name=config.lexintel.opensearch_index,
             aws_access_key_id=config.aws.access_key_id,
             aws_secret_access_key=config.aws.secret_access_key,
@@ -142,30 +142,33 @@ class ProductionIndexer:
 
             for i, (chunk, vector) in enumerate(zip(chunks, chunk_vectors)):
                 doc_id = f"bcn-{norm_id}-chunk-{i}"
+                metadata = chunk.get("metadata", {})
 
-                # Build OpenSearch document with all metadata
+                # Build OpenSearch document with flat, schema-aligned fields
                 document = {
                     "doc_id": doc_id,
                     "knowledge_id": self.config.lexintel.knowledge_id,
-                    "norm_id": norm_id,
+                    # Searchable fields
+                    "contentVector": vector,
+                    "content": chunk["content"],
+                    "title": doc_data.get("title"),
+                    "common_name": doc_data.get("common_name"),
+                    "subject_tags": doc_data.get("subject_tags", []),
                     "norm_type": doc_data.get("norm_type"),
                     "norm_number": doc_data.get("norm_number"),
-                    "formal_citation": doc_data.get("formal_citation"),
-                    "title": doc_data.get("title"),
+                    "norm_id": str(norm_id),
+                    "article_label": metadata.get("article_label"),
+                    "in_force": metadata.get("in_force"),
+                    "force_status": metadata.get("force_status"),
+                    "is_transitory": metadata.get("is_transitory", False),
                     "publication_date": doc_data.get("publication_date"),
-                    "official_url": doc_data.get("official_url"),
-                    "summary": doc_data.get("summary"),
-                    "issuing_body": doc_data.get("issuing_body"),
-                    "subject_tags": doc_data.get("subject_tags", []),
-                    "source": doc_data.get("source", "xml"),
-                    # Chunk-specific data
+                    "formatted_citation": metadata.get("formatted_citation"),
+                    # Stored only (not searchable)
+                    "url": metadata.get("official_url"),
                     "chunk_index": chunk.get("chunk_index", i),
-                    "chunk_total": len(chunks),
-                    "token_count": chunk.get("token_count"),
-                    "content": chunk["content"],
-                    "chunk_metadata": chunk.get("metadata", {}),  # Contains article_label (string) instead of article_number (int)
-                    # Embedding vector
-                    "content_vector": vector,
+                    "total_chunks": len(chunks),
+                    "norm_citation": doc_data.get("formal_citation"),
+                    "issuing_body": doc_data.get("issuing_body"),
                 }
 
                 opensearch_docs.append({"id": doc_id, "body": document})

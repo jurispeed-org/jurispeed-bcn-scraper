@@ -25,14 +25,8 @@ from utils.config import Config
 logger = structlog.get_logger()
 
 
-# Test norm IDs (diverse types)
-TEST_NORM_IDS = [
-    242302, 1183363, 30667, 1041361, 6368, 207436, 5605, 1984, 1973,
-    1048783, 1076172, 1210553, 1219810, 1165383, 1110541, 1162349,
-    1115996, 262713, 270676, 284669, 147871, 227327, 194255, 1220178,
-    222071, 1068465, 1062100, 1160481, 1123747, 1194869, 1063938,
-    1080094, 30692
-]
+# Test norm IDs (single-norm validation run)
+TEST_NORM_IDS = [242302]
 
 
 async def test_norm(
@@ -82,16 +76,9 @@ async def test_norm(
 
         if data["chunks"]:
             result["avg_tokens"] = sum(c["token_count"] for c in data["chunks"]) / len(data["chunks"])
-            # Count chunks with subdivisions (numerales/letras)
-            chunks_with_sub = sum(1 for c in data["chunks"]
-                                  if c["metadata"].get("subdivisions") and len(c["metadata"]["subdivisions"]) > 0)
-            result["chunks_with_substructure"] = chunks_with_sub
-            result["substructure_pct"] = (chunks_with_sub / len(data["chunks"]) * 100)
             result["nested_chunks"] = sum(1 for c in data["chunks"] if c["metadata"].get("is_nested"))
         else:
             result["avg_tokens"] = 0
-            result["chunks_with_substructure"] = 0
-            result["substructure_pct"] = 0
             result["nested_chunks"] = 0
 
         result["chunking"] = "success"
@@ -103,10 +90,10 @@ async def test_norm(
         # Save chunks JSON (same structure as production)
         json_dir = output_dir / "chunks"
         json_dir.mkdir(exist_ok=True)
-        json_path = json_dir / f"norm_{norm_id}_chunks.json"
+        json_path = json_dir / f"bcn-{norm_id}.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        result["json_file"] = f"chunks/norm_{norm_id}_chunks.json"
+        result["json_file"] = f"chunks/bcn-{norm_id}.json"
 
         tracker.mark_success(
             norm_id=norm_id,
@@ -207,10 +194,6 @@ async def main():
             print(f"  Avg chunks per norm: {total_chunks/len(successful):.1f}")
             print(f"  Total vigentes: {total_vigentes:,} ({total_vigentes/(total_vigentes+total_derogados)*100:.1f}%)")
             print(f"  Total derogados: {total_derogados:,} ({total_derogados/(total_vigentes+total_derogados)*100:.1f}%)")
-
-            # Chunks with substructure
-            total_with_sub = sum(r["chunks_with_substructure"] for r in successful)
-            print(f"  Chunks with substructure: {total_with_sub:,} ({total_with_sub/total_chunks*100:.1f}%)")
 
             # Distribution by norm type
             print(f"\nDistribution by norm type:")

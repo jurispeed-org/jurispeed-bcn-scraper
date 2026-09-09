@@ -68,18 +68,18 @@ async def test_deferred_effectiveness_detection():
         # Check that at least some chunks have deferred effectiveness
         chunks_with_future_effectiveness = [
             c for c in data["chunks"]
-            if c["metadata"].get("vigencia_status") == "diferida"
+            if c["metadata"].get("force_status") == "deferred"
         ]
 
         assert len(chunks_with_future_effectiveness) > 0, (
-            "No chunks with vigencia_status='diferida' found. "
+            "No chunks with force_status='deferred' found. "
             f"Total chunks: {len(data['chunks'])}"
         )
 
-        # Verify that deferred chunks have vigente=False
+        # Verify that deferred chunks have in_force=False
         for chunk in chunks_with_future_effectiveness:
-            assert chunk["metadata"].get("vigente") is False, (
-                f"Chunk with vigencia_status='diferida' has vigente={chunk['metadata'].get('vigente')} "
+            assert chunk["metadata"].get("in_force") is False, (
+                f"Chunk with force_status='deferred' has in_force={chunk['metadata'].get('in_force')} "
                 f"(expected False). Chunk: {chunk['metadata'].get('article_number')}"
             )
 
@@ -91,9 +91,9 @@ async def test_deferred_effectiveness_detection():
         print("\nExample chunks with deferred effectiveness:")
         for chunk in chunks_with_future_effectiveness[:3]:
             print(f"  - Article {chunk['metadata'].get('article_number')}: "
-                  f"fechaVersion={chunk['metadata'].get('fecha_version')}, "
-                  f"vigente={chunk['metadata'].get('vigente')}, "
-                  f"status={chunk['metadata'].get('vigencia_status')}")
+                  f"version_date={chunk['metadata'].get('version_date')}, "
+                  f"in_force={chunk['metadata'].get('in_force')}, "
+                  f"status={chunk['metadata'].get('force_status')}")
 
     finally:
         await scraper.scraper.close()

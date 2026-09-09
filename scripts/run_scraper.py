@@ -219,6 +219,7 @@ class ProductionScraper:
                     "official_url": str(norm.official_url),
                     "norm_citation": norm.formal_citation,
                     "in_force": norm_in_force,
+                    "common_name": norm.common_name,
                 }
 
                 chunks = self.chunker.chunk(
@@ -255,6 +256,7 @@ class ProductionScraper:
             "summary": norm.summary,
             "issuing_body": norm.issuing_body,
             "subject_tags": norm.subject_tags,
+            "common_name": norm.common_name,
             "source": "xml",
             "full_content": norm.full_content,
         }

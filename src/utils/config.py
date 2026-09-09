@@ -40,6 +40,10 @@ class LexintelConfig(BaseModel):
         default="normativassiiv1",
         description="Target OpenSearch index"
     )
+    opensearch_region: str = Field(
+        default="us-east-1",
+        description="AWS region of the OpenSearch domain (for SigV4 signing)"
+    )
 
 
 class ScraperConfig(BaseModel):
@@ -121,6 +125,7 @@ class Config(BaseModel):
                 password=os.getenv("LEXINTEL_PASSWORD", ""),
                 knowledge_id=os.getenv("KNOWLEDGE_ID", "normativabcn"),
                 opensearch_index=os.getenv("OPENSEARCH_INDEX", "normativassiiv1"),
+                opensearch_region=os.getenv("OPENSEARCH_REGION", "us-east-1"),
             ),
             scraper=ScraperConfig(
                 rate_limit_seconds=float(os.getenv("RATE_LIMIT_SECONDS", "2.5")),

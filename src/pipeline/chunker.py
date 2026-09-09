@@ -11,7 +11,7 @@ Follows best practices:
 
 import re
 import structlog
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from core.xml_parser import BCNXMLParser
 
@@ -191,19 +191,20 @@ class ProfessionalChunker:
 
                 norm_in_force = metadata.get("in_force", True) if metadata else True
                 norm_citation = metadata.get("norm_citation", "") if metadata else ""
+                norm_citation = self._get_display_citation(metadata, norm_citation)
 
                 if estimated_tokens <= self.article_max_size:
                     chunks = [{
                         "text": text,
                         "metadata": {
                             "part_id": None,
-                            "literal_text": text,
                             "in_force": norm_in_force,
+                            "force_status": "active" if norm_in_force else "repealed",
+                            "is_transitory": False,
                             "article_label": None,
                             "article_number": None,
                             "is_nested": False,
                             "parent_article": None,
-                            "path": {},
                             "formatted_citation": norm_citation,
                             "content_complete": True,
                         }
@@ -226,13 +227,13 @@ class ProfessionalChunker:
                             "text": section_text,
                             "metadata": {
                                 "part_id": f"section_{idx}",
-                                "literal_text": section_text,
                                 "in_force": norm_in_force,
+                                "force_status": "active" if norm_in_force else "repealed",
+                                "is_transitory": False,
                                 "article_label": None,
                                 "article_number": None,
                                 "is_nested": False,
                                 "parent_article": None,
-                                "path": {},
                                 "formatted_citation": norm_citation,
                                 "content_complete": True,
                                 "is_fragment": len(section_chunks) > 1,
@@ -513,6 +514,7 @@ class ProfessionalChunker:
         norm_type_display = self._format_norm_type_for_citation(norm_type_raw)
         # Use pre-built citation from metadata, or fallback to constructing it
         norm_citation = base_metadata.get("norm_citation") or (norm_type_display + " N° " + str(base_metadata.get("norm_number", "")))
+        norm_citation = self._get_display_citation(base_metadata, norm_citation)
         norm_title = base_metadata.get("norm_title", "")
 
         for part_id, part_info in hierarchy.items():
@@ -577,6 +579,7 @@ class ProfessionalChunker:
                 "hierarchy_level": part_info.get("hierarchy_level", 1),
                 "in_force": in_force,
                 "force_status": force_status,
+                "is_transitory": part_info.get("is_transitory", False),
                 "version_date": version_date,
                 "official_url": article_url,  # Override with article-specific URL
             })
@@ -684,6 +687,56 @@ class ProfessionalChunker:
         logger.info("idparte_chunking_complete", total_chunks=len(chunks))
         return chunks
 
+    def _split_annexes_by_treaty_article(
+        self,
+        article_texts: Dict[str, str],
+        hierarchy: dict
+    ) -> Tuple[Dict[str, str], dict]:
+        """
+        Split treaty annexes (Anexo) into one block per treaty article.
+
+        Annex text from BCN XML contains all treaty articles as plain text in a
+        single block (e.g. Tratado de Escazu has 26 articles in one <Texto>).
+        Without splitting, every chunk gets article_label="Anexo" with no way to
+        distinguish which treaty article it belongs to (Bug #3).
+
+        Detects "Articulo N" boundaries and creates synthetic part_ids/hierarchy
+        entries per treaty article, so the normal per-article chunking logic
+        (including subdivision detection) runs independently on each block.
+        """
+        new_article_texts = dict(article_texts)
+        new_hierarchy = dict(hierarchy)
+
+        article_boundary = re.compile(r'(?=\bArt[ií]culo\s+\d+\b)', re.IGNORECASE)
+
+        for part_id, part_info in hierarchy.items():
+            if not part_info.get("is_annex"):
+                continue
+
+            text = article_texts.get(part_id)
+            if not text:
+                continue
+
+            blocks = [b.strip() for b in article_boundary.split(text) if b.strip()]
+            if len(blocks) <= 1:
+                continue  # No detectable per-article structure, keep as single annex block
+
+            del new_article_texts[part_id]
+            del new_hierarchy[part_id]
+
+            for i, block in enumerate(blocks):
+                match = re.match(r'Art[ií]culo\s+(\d+)', block, re.IGNORECASE)
+                treaty_article_num = match.group(1) if match else str(i + 1)
+
+                sub_key = f"{part_id}_art{treaty_article_num}"
+                new_article_texts[sub_key] = block
+
+                sub_info = part_info.copy()
+                sub_info["article_label"] = f"Anexo, Artículo {treaty_article_num}"
+                new_hierarchy[sub_key] = sub_info
+
+        return new_article_texts, new_hierarchy
+
     def _chunk_by_xml(
         self,
         article_texts: Dict[str, str],
@@ -715,6 +768,8 @@ class ProfessionalChunker:
             logger.error("article_parser_not_found")
             raise ImportError("article_parser required for substructure")
 
+        article_texts, hierarchy = self._split_annexes_by_treaty_article(article_texts, hierarchy)
+
         chunks = []
         structural_context = structural_context or {}
 
@@ -723,6 +778,7 @@ class ProfessionalChunker:
         norm_type_display = self._format_norm_type_for_citation(norm_type_raw)
         # Use pre-built citation from metadata, or fallback to constructing it
         norm_citation = base_metadata.get("norm_citation") or (norm_type_display + " N° " + str(base_metadata.get("norm_number", "")))
+        norm_citation = self._get_display_citation(base_metadata, norm_citation)
         norm_title = base_metadata.get("norm_title", "")
 
         for part_id, article_text in article_texts.items():
@@ -800,6 +856,7 @@ class ProfessionalChunker:
                 "hierarchy_level": part_info.get("hierarchy_level", 1),
                 "in_force": in_force,
                 "force_status": force_status,
+                "is_transitory": part_info.get("is_transitory", False),
                 "version_date": version_date,
                 "official_url": article_url,  # Override with article-specific URL
                 # Structural context (CRITICAL for filters and citations)
@@ -823,9 +880,6 @@ class ProfessionalChunker:
             )
             full_text = contextual_header + article_text
 
-            # Build structured path for metadata
-            structured_path = self._build_structured_path(context)
-
             # Build formatted citation
             formatted_citation = self._build_formatted_citation(
                 norm_citation, article_label, context
@@ -834,9 +888,6 @@ class ProfessionalChunker:
             # Build metadata with new structure
             chunk_metadata = base_chunk_metadata.copy()
             chunk_metadata.update({
-                "literal_text": article_text,  # Article text without header
-                "subdivisions": subdivisions,   # List of subdivision positions
-                "path": structured_path,        # Hierarchical path as nested dict
                 "formatted_citation": formatted_citation,  # Formal citation
             })
 
@@ -895,13 +946,23 @@ class ProfessionalChunker:
                         reason=split_reason
                     )
 
+                    # Text before the first subdivision (e.g. the governing clause
+                    # introducing a numeral list) and after the last one is NOT
+                    # covered by any subdivision span. Without handling it here it
+                    # gets silently dropped from every chunk in this article.
+                    preamble_text = article_text[:subdivisions[0]['start']].strip()
+                    trailing_text = article_text[subdivisions[-1]['end']:].strip()
+
                     for subdiv_idx, subdiv in enumerate(subdivisions):
                         # Extract subdivision text using positions
                         subdiv_text = article_text[subdiv['start']:subdiv['end']]
+                        if subdiv_idx == 0 and preamble_text:
+                            subdiv_text = preamble_text + "\n" + subdiv_text
 
                         # Build contextual header with fragment indicator
                         subdivision_context = self._build_subdivision_context(
-                            norm_citation, norm_title, context, article_label, subdiv['mark']
+                            norm_citation, norm_title, context, article_label, subdiv['mark'],
+                            parent_numeral=subdiv.get('parent_numeral')
                         )
                         full_sub_text = subdivision_context + subdiv_text
 
@@ -923,7 +984,13 @@ class ProfessionalChunker:
 
                             for para_idx, para_text in enumerate(subdiv_paragraphs):
                                 # Rebuild full text with context header
-                                full_para_text = subdivision_context + para_text
+                                if len(subdiv_paragraphs) > 1:
+                                    paragraph_note = (
+                                        f"[Parte {para_idx + 1} de {len(subdiv_paragraphs)}]\n\n"
+                                    )
+                                else:
+                                    paragraph_note = ""
+                                full_para_text = subdivision_context + paragraph_note + para_text
 
                                 # Add binary note to last paragraph of last subdivision if present
                                 if binary_info and subdiv_idx == len(subdivisions) - 1 and para_idx == len(subdiv_paragraphs) - 1:
@@ -943,15 +1010,25 @@ class ProfessionalChunker:
                                     "subdivision_type": subdiv['type'],
                                     "subdivision_index": subdiv_idx + 1,
                                     "total_subdivisions": len(subdivisions),
+                                    "parent_numeral": subdiv.get('parent_numeral'),
                                     "paragraph_fragment": True,
                                     "paragraph_index": para_idx + 1,
                                     "total_paragraphs": len(subdiv_paragraphs)
                                 })
 
-                                # Update formatted_citation with subdivision
+                                # Update formatted_citation with subdivision (include parent
+                                # numeral when this letra is nested under one)
                                 base_citation = chunk_metadata.get("formatted_citation", "")
                                 subdiv_type_label = "numeral" if subdiv['type'] == 'numeral' else "letra"
-                                para_metadata["formatted_citation"] = f"{base_citation}, {subdiv_type_label} {subdiv['mark']}"
+                                subdiv_citation_part = f"{subdiv_type_label} {subdiv['mark']}"
+                                if subdiv.get('parent_numeral'):
+                                    subdiv_citation_part = f"numeral {subdiv['parent_numeral']}, {subdiv_citation_part}"
+                                if len(subdiv_paragraphs) > 1:
+                                    # Without this, every paragraph fragment of the same
+                                    # subdivision would carry an identical citation, making
+                                    # them indistinguishable for exact-citation lookups.
+                                    subdiv_citation_part += f" (parte {para_idx + 1} de {len(subdiv_paragraphs)})"
+                                para_metadata["formatted_citation"] = f"{base_citation}, {subdiv_citation_part}"
 
                                 chunks.append({
                                     "text": full_para_text,
@@ -985,13 +1062,18 @@ class ProfessionalChunker:
                                 "subdivision_mark": subdiv['mark'],
                                 "subdivision_type": subdiv['type'],
                                 "subdivision_index": subdiv_idx + 1,
-                                "total_subdivisions": len(subdivisions)
+                                "total_subdivisions": len(subdivisions),
+                                "parent_numeral": subdiv.get('parent_numeral')
                             })
 
-                            # Update formatted_citation with subdivision
+                            # Update formatted_citation with subdivision (include parent
+                            # numeral when this letra is nested under one)
                             base_citation = chunk_metadata.get("formatted_citation", "")
                             subdiv_type_label = "numeral" if subdiv['type'] == 'numeral' else "letra"
-                            sub_metadata["formatted_citation"] = f"{base_citation}, {subdiv_type_label} {subdiv['mark']}"
+                            subdiv_citation_part = f"{subdiv_type_label} {subdiv['mark']}"
+                            if subdiv.get('parent_numeral'):
+                                subdiv_citation_part = f"numeral {subdiv['parent_numeral']}, {subdiv_citation_part}"
+                            sub_metadata["formatted_citation"] = f"{base_citation}, {subdiv_citation_part}"
 
                             chunks.append({
                                 "text": full_sub_text,
@@ -1005,6 +1087,43 @@ class ProfessionalChunker:
                                 subdivision=subdiv['mark'],
                                 tokens=subdiv_tokens
                             )
+
+                    # Text after the last subdivision (e.g. closing paragraphs not
+                    # part of the numeral/letra list) is semantically distinct from
+                    # the last subdivision -- emit it as its own chunk instead of
+                    # silently dropping it or gluing it onto an unrelated numeral.
+                    if trailing_text:
+                        trailing_base_citation = chunk_metadata.get("formatted_citation", "")
+                        trailing_pieces = [trailing_text]
+                        if self.estimate_tokens(contextual_header + trailing_text) > self.article_max_size:
+                            trailing_pieces = self._split_by_separator(trailing_text, r"\n\n")
+
+                        for t_idx, t_text in enumerate(trailing_pieces):
+                            trailing_metadata = chunk_metadata.copy()
+                            trailing_citation = f"{trailing_base_citation} (texto final)"
+                            if len(trailing_pieces) > 1:
+                                trailing_citation += f" (parte {t_idx + 1} de {len(trailing_pieces)})"
+                            trailing_metadata.update({
+                                "is_fragment": True,
+                                "fragment_of": article_label,
+                                "trailing_fragment": True,
+                                "fragment_index": t_idx + 1,
+                                "total_fragments": len(trailing_pieces),
+                                "formatted_citation": trailing_citation,
+                            })
+                            note = f"\n\n[Texto final del artículo, fuera de la lista de numerales/letras]\n\n"
+                            chunks.append({
+                                "text": contextual_header + note + t_text,
+                                "metadata": trailing_metadata
+                            })
+
+                        logger.info(
+                            "trailing_text_after_subdivisions_captured",
+                            part_id=part_id,
+                            article_number=article_num,
+                            trailing_chars=len(trailing_text),
+                            pieces=len(trailing_pieces)
+                        )
                 else:
                     # No subdivisions detected, fallback to paragraph split
                     logger.warning(
@@ -1015,7 +1134,11 @@ class ProfessionalChunker:
                     )
                     sub_chunks_text = self._split_by_separator(article_text, r"\n\n")
                     for sub_idx, sub_text in enumerate(sub_chunks_text):
-                        full_sub_text = contextual_header + sub_text
+                        fragment_note = (
+                            f"\n\n[Fragmento {sub_idx + 1} de {len(sub_chunks_text)} "
+                            f"del artículo completo]\n\n"
+                        )
+                        full_sub_text = contextual_header + fragment_note + sub_text
 
                         # Add binary note to last sub-chunk if present
                         if binary_info and sub_idx == len(sub_chunks_text) - 1:
@@ -1035,6 +1158,13 @@ class ProfessionalChunker:
                             "fragment_index": sub_idx + 1,
                             "total_fragments": len(sub_chunks_text)
                         })
+                        if len(sub_chunks_text) > 1:
+                            # Without this, every fragment of this article would carry the
+                            # exact same citation, making them indistinguishable.
+                            base_citation = chunk_metadata.get("formatted_citation", "")
+                            sub_metadata["formatted_citation"] = (
+                                f"{base_citation} (parte {sub_idx + 1} de {len(sub_chunks_text)})"
+                            )
 
                         chunks.append({
                             "text": full_sub_text,
@@ -1072,6 +1202,7 @@ class ProfessionalChunker:
         norm_type_display = self._format_norm_type_for_citation(norm_type_raw)
         # Use pre-built citation from metadata, or fallback to constructing it
         norm_citation = base_metadata.get("norm_citation") or (norm_type_display + " N° " + str(base_metadata.get("norm_number", "")))
+        norm_citation = self._get_display_citation(base_metadata, norm_citation)
         norm_title = base_metadata.get("norm_title", "")
 
         # Combine all article texts to find what's NOT in articles
@@ -1324,10 +1455,15 @@ class ProfessionalChunker:
                 num_subchunks = (part_tokens // self.max_chunk_size) + 1
                 chars_per_chunk = len(part) // num_subchunks
 
-                chunks_created = 0
                 current_pos = 0
 
-                while current_pos < len(part) and chunks_created < num_subchunks:
+                # NOTE: num_subchunks is only an ESTIMATE used to size chars_per_chunk.
+                # The loop must run until current_pos reaches len(part), not stop once
+                # num_subchunks pieces are produced -- otherwise the final tail of text
+                # (whatever didn't fit in the estimated number of pieces) gets silently
+                # dropped. This previously truncated the last fragment of large articles
+                # (e.g. Disposicion Transitoria text with no "\n\n" breaks).
+                while current_pos < len(part):
                     target_end = min(current_pos + chars_per_chunk, len(part))
 
                     if target_end < len(part):
@@ -1346,7 +1482,6 @@ class ProfessionalChunker:
 
                     if sub_part:
                         chunks.append(sub_part)
-                        chunks_created += 1
 
                     current_pos = boundary
 
@@ -1531,7 +1666,8 @@ class ProfessionalChunker:
         norm_title: str,
         context: Dict,
         article_label: str,
-        subdivision_mark: str
+        subdivision_mark: str,
+        parent_numeral: Optional[str] = None
     ) -> str:
         """
         Build contextual header for article subdivisions (fragments).
@@ -1587,42 +1723,30 @@ class ProfessionalChunker:
         # Determine subdivision type from mark
         subdiv_type = "Numeral" if subdivision_mark[0].isdigit() else "Letra"
 
-        fragment_note = f"\n\n[Fragmento del artículo completo - {subdiv_type} {subdivision_mark}]\n\n"
+        subdiv_descriptor = f"{subdiv_type} {subdivision_mark}"
+        if parent_numeral:
+            # Letra nested under a numeral: keep the numeral visible in the header
+            # instead of dropping it (e.g. "Numeral 1.- > Letra a)").
+            subdiv_descriptor = f"Numeral {parent_numeral} > {subdiv_descriptor}"
+
+        fragment_note = f"\n\n[Fragmento del artículo completo - {subdiv_descriptor}]\n\n"
 
         return header + fragment_note
 
-    def _build_structured_path(self, context: Dict) -> Dict:
+    def _get_display_citation(self, base_metadata: Optional[Dict], formal_citation: str) -> str:
         """
-        Build structured path as nested dictionary.
+        Prefer the norm's common/popular name (e.g. "Constitucion Politica De La
+        Republica De Chile") over the formal type+number citation (e.g. "Decreto
+        N° 100") for the text that gets embedded and searched -- the formal
+        citation alone doesn't let a search for "Constitucion" match its chunks.
 
-        Returns:
-            {
-                "book": {"ordinal": "LIBRO SEGUNDO", "name": "..."},
-                "title": {"ordinal": "TITULO OCTAVO", "name": "..."},
-                "section": {"ordinal": "§1 bis", "name": "Del femicidio"}
-            }
+        common_name comes from BCN as raw uppercase with no accents; title-case it
+        for readability (accents can't be recovered from the source).
         """
-        path = {}
-
-        if context.get("book"):
-            path["book"] = {
-                "ordinal": context["book"],
-                "name": context.get("book_name", "")
-            }
-
-        if context.get("title_ordinal"):
-            path["title"] = {
-                "ordinal": context["title_ordinal"],
-                "name": context.get("title_name", "")
-            }
-
-        if context.get("section"):
-            path["section"] = {
-                "ordinal": context["section"],
-                "name": context.get("section_name", "")
-            }
-
-        return path
+        common_name = (base_metadata or {}).get("common_name")
+        if common_name:
+            return common_name.title()
+        return formal_citation
 
     def _format_norm_type_for_citation(self, norm_type: str) -> str:
         """

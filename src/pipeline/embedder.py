@@ -92,6 +92,7 @@ class BedrockEmbedder:
                 "input_type": self.input_type,
                 "embedding_types": ["float"],
                 "truncate": "END",  # Truncate if exceeds 128K tokens
+                "output_dimension": self.dimensions,
             }
 
             # Call Bedrock
@@ -105,11 +106,17 @@ class BedrockEmbedder:
             # Parse response
             response_body = json.loads(response["body"].read())
 
-            # Extract embeddings
+            # Extract embeddings (embedding_types=["float"] returns {"float": [[...], ...]})
             embeddings = response_body.get("embeddings")
 
             if not embeddings:
                 raise ValueError("No embeddings in response")
+
+            if isinstance(embeddings, dict):
+                embeddings = embeddings.get("float")
+
+            if not embeddings:
+                raise ValueError("No float embeddings in response")
 
             if len(embeddings) != len(texts):
                 raise ValueError(

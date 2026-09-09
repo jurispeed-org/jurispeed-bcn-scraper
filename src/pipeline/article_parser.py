@@ -39,6 +39,8 @@ class ArticleSubstructureParser:
         # Patterns for numerales (expanded to detect more formats)
         # ORDER MATTERS: more specific patterns first
         self.numeral_patterns = [
+            r'^\s*(\d+)º\.-\s+',  # "1º.- texto" (ORDINAL before dot-hyphen, e.g. Constitucion Art 19)
+            r'^\s*(\d+)°\.-\s+',  # "1°.- texto" (degree symbol before dot-hyphen)
             r'^\s*(\d+)\.-\s+',  # "1.- texto" (with hyphen - common in Chilean law)
             r'^\s*(\d+)\.º\s+',  # "1.º texto" (MASCULINE ORDINAL - BCN uses this)
             r'^\s*(\d+)\.°\s+',  # "1.° texto" (degree symbol - alternate)
@@ -52,6 +54,9 @@ class ArticleSubstructureParser:
         # Inline numeral patterns (for cases like "...y 3.- texto")
         # These detect numerals NOT at line start
         self.inline_numeral_patterns = [
+            r'\s+y\s+(\d+)º\.-\s+',  # "y 3º.- texto" (ORDINAL before dot-hyphen)
+            r'\s+y\s+(\d+)°\.-\s+',  # "y 3°.- texto" (degree symbol before dot-hyphen)
+            r',\s*y\s+(\d+)º\.-\s+', # ", y 3º.- texto" (with comma, ORDINAL before dot-hyphen)
             r'\s+y\s+(\d+)\.-\s+',   # "y 3.- texto" (inline after "y")
             r'\s+y\s+(\d+)\.º\s+',   # "y 3.º texto" (MASCULINE ORDINAL)
             r'\s+y\s+(\d+)\.°\s+',   # "y 3.° texto" (degree symbol)
@@ -65,6 +70,15 @@ class ArticleSubstructureParser:
             r'^\s*([a-z])\)\s+',  # "a) texto"
             r'^\s*letra\s+([a-z])\)',  # "letra a) texto"
         ]
+
+        # BCN plain-text formatting uses two visual columns: body text on the
+        # left (indented ~5 spaces for numerales/letras/incisos) and marginal
+        # notes (law citations, "D.O." dates) column-aligned far to the right.
+        # A marker preceded by an unusually large run of whitespace is a
+        # marginal note that happens to start with "N° X" / "letra x)", not a
+        # real subdivision -- e.g. "                    ...   letra b) D.O.
+        # 26.08.2005" referencing an amendment law, not a real list item.
+        self.MARGIN_NOTE_INDENT_THRESHOLD = 20
 
     def parse(self, article_text: str) -> List[SubPart]:
         """
@@ -114,19 +128,14 @@ class ArticleSubstructureParser:
         lines = text.split('\n')
 
         for line in lines:
-            # Check line-start numerales
-            for pattern in self.numeral_patterns:
-                if re.match(pattern, line, re.IGNORECASE):
-                    return True
+            # Line-start numerales/letras: reuse the same matchers used for
+            # splitting, so marginal-note false positives are excluded here too.
+            if self._match_numeral(line) or self._match_letter(line):
+                return True
 
             # Check inline numerales (e.g., "y 3.-" cases)
             for pattern in self.inline_numeral_patterns:
                 if re.search(pattern, line, re.IGNORECASE):
-                    return True
-
-            # Check letras
-            for pattern in self.letter_patterns:
-                if re.match(pattern, line, re.IGNORECASE):
                     return True
 
         return False
@@ -216,6 +225,35 @@ class ArticleSubstructureParser:
 
         return subparts
 
+    def _is_marginal_note(self, line: str, match) -> bool:
+        """
+        Check if a matched marker is a false positive rather than a real
+        subdivision marker in the body text. Two known false-positive shapes:
+
+        1. Marginal notes: BCN's plain-text formatting uses a right-hand
+           column (law citations, "D.O." dates) that is column-aligned far to
+           the right of the body text -- a marker preceded by an unusually
+           large run of whitespace belongs to that column, not the body.
+        2. Word-wrapped continuations: a real marker always starts a new
+           paragraph, indented by BCN's standard ~5-space paragraph indent.
+           Zero leading whitespace means the line is a wrapped continuation
+           of the previous line's sentence (e.g. "...senalado en la\nletra
+           a), debera aplicarse..."), not a new subdivision.
+        """
+        leading_whitespace = len(line) - len(line.lstrip(' '))
+
+        if leading_whitespace == 0:
+            return True
+
+        if leading_whitespace >= self.MARGIN_NOTE_INDENT_THRESHOLD:
+            return True
+
+        remaining_text = line[match.end():].strip()
+        if remaining_text.startswith('D.O.') or remaining_text.startswith('D O'):
+            return True
+
+        return False
+
     def _match_numeral(self, line: str) -> Optional[Dict]:
         """
         Check if line starts with a numeral marker.
@@ -226,18 +264,13 @@ class ArticleSubstructureParser:
         for pattern in self.numeral_patterns:
             match = re.match(pattern, line, re.IGNORECASE)
             if match:
+                if self._is_marginal_note(line, match):
+                    continue
+
                 number = int(match.group(1))
                 remaining_text = line[match.end():].strip()
                 # Preserve literal mark from text
                 mark_literal = match.group(0).strip()  # "1.º " -> "1.º"
-
-                # FILTER: Ignore "N° X D.O." patterns (editorial marginal notes)
-                # These are not subdivisions, they're references to Diario Oficial
-                if 'N°' in mark_literal or 'Nº' in mark_literal:
-                    # Check if remaining text starts with "D.O." (Diario Oficial)
-                    if remaining_text.startswith('D.O.') or remaining_text.startswith('D O'):
-                        # This is a marginal note, not a subdivision
-                        continue
 
                 return {
                     'number': number,
@@ -343,6 +376,9 @@ class ArticleSubstructureParser:
         for pattern in self.letter_patterns:
             match = re.match(pattern, line, re.IGNORECASE)
             if match:
+                if self._is_marginal_note(line, match):
+                    continue
+
                 letter = match.group(1)
                 remaining_text = line[match.end():].strip()
                 # Preserve literal mark from text
@@ -441,6 +477,7 @@ def extract_subdivisions_metadata(article_text: str) -> List[Dict]:
 
     lines = article_text.split('\n')
     current_pos = 0
+    current_numeral_mark = None  # tracks the most recent numeral, so nested letras keep it in context
 
     for line in lines:
         line_len = len(line) + 1  # +1 for newline
@@ -449,6 +486,7 @@ def extract_subdivisions_metadata(article_text: str) -> List[Dict]:
         numeral_match = parser._match_numeral(line)
         if numeral_match:
             # Use literal mark from text, not reconstructed
+            current_numeral_mark = numeral_match['mark']
             subdivisions.append({
                 "type": "numeral",
                 "mark": numeral_match['mark'],  # "1.º" as it appears in XML
@@ -460,12 +498,18 @@ def extract_subdivisions_metadata(article_text: str) -> List[Dict]:
         letter_match = parser._match_letter(line)
         if letter_match:
             # Use literal mark from text, not reconstructed
-            subdivisions.append({
+            letra_subdivision = {
                 "type": "letra",
                 "mark": letter_match['mark'],  # "a)" as it appears in XML
                 "letter": letter_match['letter'],
                 "start": current_pos
-            })
+            }
+            # A letra nested under a numeral (e.g. "1°.- ... a) ...") must keep the
+            # numeral in its structural context, otherwise the numeral is silently
+            # dropped from the chunk's header/citation.
+            if current_numeral_mark:
+                letra_subdivision["parent_numeral"] = current_numeral_mark
+            subdivisions.append(letra_subdivision)
 
         current_pos += line_len
 

@@ -191,62 +191,6 @@ class OpenSearchIndexer:
             self.stats["failed"] += len(documents)
             raise
 
-    def create_norm_document(
-        self,
-        doc_id: str,
-        knowledge_id: str,
-        norm_data: Dict,
-        chunk_text: str,
-        chunk_vector: List[float],
-        chunk_index: int,
-        chunk_total: int,
-    ) -> Dict:
-        """
-        Create OpenSearch document following existing schema.
-
-        Args:
-            doc_id: Unique document ID
-            knowledge_id: Knowledge base ID (e.g., "normativabcn")
-            norm_data: Norm metadata (tipo_norma, titulo, etc.)
-            chunk_text: Text content of this chunk
-            chunk_vector: Embedding vector (512 dims)
-            chunk_index: Chunk index (0-based)
-            chunk_total: Total chunks
-
-        Returns:
-            Document ready for indexing
-        """
-        document = {
-            # IDs
-            "doc_id": doc_id,
-            "knowledge_id": knowledge_id,
-            # Chunk metadata
-            "chunk_index": chunk_index,
-            "chunk_total": chunk_total,
-            # Content
-            "content": chunk_text,
-            "contentVector": chunk_vector,
-            # Norm metadata (Spanish field names for compatibility)
-            "tipo_norma": norm_data.get("tipo_norma"),
-            "numero_norma": norm_data.get("numero_norma"),
-            "titulo": norm_data.get("titulo"),
-            "fecha_publicacion": norm_data.get("fecha_publicacion"),
-            "fecha_promulgacion": norm_data.get("fecha_promulgacion"),
-            "ultima_modificacion": norm_data.get("ultima_modificacion"),
-            "organismo": norm_data.get("organismo"),
-            "version": norm_data.get("version"),
-            "materias": norm_data.get("materias", []),
-            "url_oficial": norm_data.get("url_oficial"),
-            # Resumen (⭐ only in first chunk)
-            "resumen": norm_data.get("resumen") if chunk_index == 0 else None,
-            "resumen_vector": norm_data.get("resumen_vector") if chunk_index == 0 else None,
-        }
-
-        # Remove None values
-        document = {k: v for k, v in document.items() if v is not None}
-
-        return document
-
     def get_stats(self) -> Dict:
         """Get indexing statistics."""
         return self.stats.copy()

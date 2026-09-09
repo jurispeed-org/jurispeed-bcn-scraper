@@ -215,9 +215,12 @@ def check_codigo_penal_numerals(data: dict) -> list:
             })
             continue
 
-        # Check if subdivisions were detected
+        # Subdivisions are no longer stored as metadata (removed field). Detecting
+        # them below SUBDIVISION_SPLIT_THRESHOLD does not force a chunk split, so
+        # check for recognized numeral markers directly in the chunk content instead.
+        numeral_pattern = re.compile(r'\d+[ºo°]\.-?\s|\d+\.[ºo°]\s|\d+\.-\s')
         has_subdivisions = any(
-            c["metadata"].get("subdivisions") and len(c["metadata"]["subdivisions"]) > 0
+            numeral_pattern.search(c["content"])
             for c in article_chunks
         )
 
@@ -300,7 +303,7 @@ def check_non_articulated_metadata(data: dict) -> list:
     """Verify non-articulated norms have complete metadata."""
     checks = []
 
-    required_fields = ["in_force", "literal_text", "formatted_citation"]
+    required_fields = ["in_force", "force_status", "formatted_citation"]
 
     if data["chunks"]:
         first_chunk_meta = data["chunks"][0]["metadata"]

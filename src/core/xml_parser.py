@@ -26,6 +26,28 @@ class BCNXMLParser:
     # XML namespace
     NS = {'ns': 'http://www.leychile.cl/esquemas'}
 
+    # tipoParte values treated as articles (Disposición Transitoria are
+    # transitory provisions, structurally equivalent to regular articles)
+    ARTICLE_TIPO_PARTE = {'Artículo', 'Disposición Transitoria'}
+
+    # BCN's plain-text export lays out the article body and its margin notes
+    # (e.g. "CPR Art. 19° N° 24", "D.O. 24.10.1980") side by side in fixed-width
+    # columns on the same line. A run of 4+ spaces after real content marks the
+    # start of the margin-note column; strip it so it doesn't get embedded mid-word
+    # (lookbehind requires a non-space char right before the gap, so it never
+    # touches a line's own leading indentation).
+    _MARGIN_NOTE_PATTERN = re.compile(r'(?<=\S) {4,}\S.*$', re.MULTILINE)
+
+    def _strip_margin_notes(self, text: str) -> str:
+        return self._MARGIN_NOTE_PATTERN.sub('', text)
+
+    def _find_article_structures(self, root: ET.Element) -> List[ET.Element]:
+        """Find all EstructuraFuncional elements that represent articles (regular or transitory)."""
+        return [
+            structure for structure in root.findall('.//ns:EstructuraFuncional', self.NS)
+            if structure.get('tipoParte') in self.ARTICLE_TIPO_PARTE
+        ]
+
     @staticmethod
     def is_future_version(version_date_str: Optional[str]) -> bool:
         """
@@ -155,6 +177,9 @@ class BCNXMLParser:
 
             official_url = f"https://bcn.cl/leychile/navegar?idNorma={norm_id}"
 
+            subject_tags = self._extract_subject_tags(root)
+            common_name = self._extract_common_name(root)
+
             return {
                 "norm_id": norm_id,
                 "norm_type": norm_type,
@@ -166,13 +191,29 @@ class BCNXMLParser:
                 "issuing_body": issuing_body,
                 "summary": summary,
                 "official_url": official_url,
-                "subject_tags": [],
+                "subject_tags": subject_tags,
+                "common_name": common_name,
                 "version": version_date_str,
             }
 
         except Exception as e:
             logger.error("metadata_extraction_error", error=str(e))
             return None
+
+    def _extract_subject_tags(self, root: ET.Element) -> List[str]:
+        """Extract curated BCN subject tags from <Materias>/<Materia>."""
+        tags = []
+        for materia_elem in root.findall('.//ns:Materias/ns:Materia', self.NS):
+            if materia_elem.text and materia_elem.text.strip():
+                tags.append(materia_elem.text.strip())
+        return tags
+
+    def _extract_common_name(self, root: ET.Element) -> Optional[str]:
+        """Extract popular name from <NombresUsoComun>/<NombreUsoComun>."""
+        name_elem = root.find('.//ns:NombresUsoComun/ns:NombreUsoComun', self.NS)
+        if name_elem is not None and name_elem.text and name_elem.text.strip():
+            return name_elem.text.strip()
+        return None
 
     def extract_norm_vigencia(self, xml_content: str) -> bool:
         """
@@ -396,14 +437,14 @@ class BCNXMLParser:
 
         header = root.find('ns:Encabezado/ns:Texto', self.NS)
         if header is not None:
-            text = self._extract_text_without_binaries(header)
+            text = self._strip_margin_notes(self._extract_text_without_binaries(header))
             if text:
                 content_parts.append(text)
 
         for structure in root.findall('.//ns:EstructuraFuncional', self.NS):
             text_elem = structure.find('ns:Texto', self.NS)
             if text_elem is not None:
-                text = self._extract_text_without_binaries(text_elem)
+                text = self._strip_margin_notes(self._extract_text_without_binaries(text_elem))
                 if text:
                     content_parts.append(text)
 
@@ -431,7 +472,7 @@ class BCNXMLParser:
 
             parent_map = {c: p for p in root.iter() for c in p}
 
-            for structure in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
+            for structure in self._find_article_structures(root):
                 id_parte = structure.get('idParte')
                 if not id_parte:
                     continue
@@ -439,17 +480,31 @@ class BCNXMLParser:
                 name_elem = structure.find('.//ns:NombreParte', self.NS)
                 article_label = name_elem.text.strip() if name_elem is not None and name_elem.text else None
 
+                if article_label:
+                    # Normalize suffixes to lowercase (390 BIS -> 390 bis)
+                    article_label = re.sub(
+                        r'\b(BIS|TER|QUATER|QUINQUIES|SEXIES|SEPTIES|OCTIES|NONIES|DECIES)\b',
+                        lambda m: m.group(1).lower(),
+                        article_label
+                    )
+
+                article_number = self._extract_article_number(article_label) if article_label else None
+
                 if not article_label:
-                    continue
-
-                # Normalize suffixes to lowercase (390 BIS -> 390 bis)
-                article_label = re.sub(
-                    r'\b(BIS|TER|QUATER|QUINQUIES|SEXIES|SEPTIES|OCTIES|NONIES|DECIES)\b',
-                    lambda m: m.group(1).lower(),
-                    article_label
-                )
-
-                article_number = self._extract_article_number(article_label)
+                    # No NombreParte. Some nodes with an article-like tipoParte are actually
+                    # section-heading containers that wrap real articles as children (e.g. a
+                    # "DISPOSICIONES TRANSITORIAS" divider wrapping the actual transitory
+                    # articles) -- those must stay excluded, same as before this fallback.
+                    # A genuine article missing only its label is a leaf (no nested article
+                    # children); keep those with a fallback label so they aren't silently
+                    # dropped from the chunker output.
+                    has_nested_articles = any(
+                        child.get('tipoParte') in self.ARTICLE_TIPO_PARTE
+                        for child in structure.findall('.//ns:EstructuraFuncional', self.NS)
+                    )
+                    if has_nested_articles:
+                        continue
+                    article_label = f"Artículo {article_number}" if article_number else "Contenido"
 
                 # 1. Legacy: has "DEL ART" in name
                 is_nested_legacy = 'DEL ART' in article_label.upper()
@@ -479,6 +534,9 @@ class BCNXMLParser:
 
                 version_date_str = structure.get('fechaVersion')
 
+                transitorio_attr = structure.get('transitorio', 'no transitorio')
+                is_transitory = transitorio_attr == 'transitorio'
+
                 hierarchy[id_parte] = {
                     'article_number': article_number,
                     'article_label': article_label,
@@ -487,6 +545,7 @@ class BCNXMLParser:
                     'hierarchy_level': hierarchy_level,
                     'in_force': in_force,
                     'version_date': version_date_str,
+                    'is_transitory': is_transitory,
                 }
 
             # Extract treaty annexes (Tratados internacionales)
@@ -516,6 +575,7 @@ class BCNXMLParser:
                     'hierarchy_level': 0,
                     'in_force': in_force,
                     'version_date': version_date_str,
+                    'is_transitory': False,
                 }
 
             logger.info(
@@ -718,7 +778,7 @@ class BCNXMLParser:
             root = ET.fromstring(xml_content)
             article_texts = {}
 
-            for structure in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
+            for structure in self._find_article_structures(root):
                 id_parte = structure.get('idParte')
                 if not id_parte:
                     continue
@@ -726,8 +786,8 @@ class BCNXMLParser:
                 # Get text element
                 text_elem = structure.find('ns:Texto', self.NS)
                 if text_elem is not None:
-                    # Extract all text, skipping binary attachments
-                    text = self._extract_text_without_binaries(text_elem)
+                    # Extract all text, skipping binary attachments and margin notes
+                    text = self._strip_margin_notes(self._extract_text_without_binaries(text_elem))
                     if text:
                         article_texts[id_parte] = text
 
@@ -741,8 +801,8 @@ class BCNXMLParser:
                 # Get text element
                 text_elem = annex.find('ns:Texto', self.NS)
                 if text_elem is not None:
-                    # Extract all text, skipping binary attachments
-                    text = self._extract_text_without_binaries(text_elem)
+                    # Extract all text, skipping binary attachments and margin notes
+                    text = self._strip_margin_notes(self._extract_text_without_binaries(text_elem))
                     if text:
                         # Use same special key as in hierarchy
                         annex_key = f"anexo_{id_parte}"
@@ -788,7 +848,7 @@ class BCNXMLParser:
             context_map = {}
 
             # Find all articles and walk up to get their structural context
-            for article in root.findall('.//ns:EstructuraFuncional[@tipoParte="Artículo"]', self.NS):
+            for article in self._find_article_structures(root):
                 id_parte = article.get('idParte')
                 if not id_parte:
                     continue

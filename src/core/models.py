@@ -82,6 +82,9 @@ class ChileanLegalNorm(BaseModel):
     subject_tags: List[str] = Field(
         default_factory=list, description="Legal subject matter tags"
     )
+    common_name: Optional[str] = Field(
+        None, description="Popular name (e.g. 'Codigo del Trabajo', 'Constitucion')"
+    )
 
     official_url: HttpUrl = Field(..., description="Canonical BCN URL")
 

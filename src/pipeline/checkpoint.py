@@ -187,7 +187,7 @@ class CheckpointManager:
             logger.info(
                 "checkpoint_marked_completed",
                 instance_id=self.instance_id,
-                final_stats=final_stats.to_dict(),
+                final_stats=final_stats.to_dict() if hasattr(final_stats, "to_dict") else final_stats,
             )
 
         except Exception as e:
