@@ -10,6 +10,7 @@ Follows best practices:
 """
 
 import re
+import unicodedata
 import structlog
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -847,16 +848,33 @@ class ProfessionalChunker:
                         total_articles_with_context=len(structural_context)
                     )
 
+            is_transitory = part_info.get("is_transitory", False)
+            descriptor = self._article_descriptor(article_label, is_transitory)
+            # Transitory provisions carry no number of their own, which left
+            # article_number null and made them invisible to numeric filters and
+            # ordering. The ordinal derived from the label fills that gap; it is
+            # unique only when paired with is_transitory, since permanent art. 41
+            # and the 41st transitory provision share the number.
+            if article_num is None and descriptor["ordinal"] is not None:
+                article_num = descriptor["ordinal"]
+            if article_num is None:
+                # Many decretos number their permanent articulado with spelled-out
+                # ordinals ("Artículo primero"), which leaves no digits to parse.
+                # The label itself is kept verbatim; only the numeric field is filled.
+                article_num = self._spanish_ordinal_to_int(article_label)
+
             base_chunk_metadata.update({
                 "part_id": part_id,
                 "article_number": article_num,
                 "article_label": article_label,
+                # Canonical spelling, since BCN's own labels are inconsistent
+                "article_label_normalized": descriptor["normalized_label"],
                 "parent_article": part_info.get("parent_article"),
                 "is_nested": part_info.get("is_nested", False),
                 "hierarchy_level": part_info.get("hierarchy_level", 1),
                 "in_force": in_force,
                 "force_status": force_status,
-                "is_transitory": part_info.get("is_transitory", False),
+                "is_transitory": is_transitory,
                 "version_date": version_date,
                 "official_url": article_url,  # Override with article-specific URL
                 # Structural context (CRITICAL for filters and citations)
@@ -876,13 +894,13 @@ class ProfessionalChunker:
             # Build contextual header with FULL structural path
             # Use · separator for cleaner hierarchy display
             contextual_header = self._build_contextual_header_with_dot_separator(
-                norm_citation, norm_title, context, article_label
+                norm_citation, norm_title, context, article_label, is_transitory
             )
             full_text = contextual_header + article_text
 
             # Build formatted citation
             formatted_citation = self._build_formatted_citation(
-                norm_citation, article_label, context
+                norm_citation, article_label, context, is_transitory
             )
 
             # Build metadata with new structure
@@ -953,6 +971,8 @@ class ProfessionalChunker:
                     preamble_text = article_text[:subdivisions[0]['start']].strip()
                     trailing_text = article_text[subdivisions[-1]['end']:].strip()
 
+                    subdivision_series = self._assign_subdivision_series(subdivisions)
+
                     for subdiv_idx, subdiv in enumerate(subdivisions):
                         # Extract subdivision text using positions
                         subdiv_text = article_text[subdiv['start']:subdiv['end']]
@@ -962,7 +982,8 @@ class ProfessionalChunker:
                         # Build contextual header with fragment indicator
                         subdivision_context = self._build_subdivision_context(
                             norm_citation, norm_title, context, article_label, subdiv['mark'],
-                            parent_numeral=subdiv.get('parent_numeral')
+                            parent_numeral=subdiv.get('parent_numeral'),
+                            is_transitory=is_transitory
                         )
                         full_sub_text = subdivision_context + subdiv_text
 
@@ -1019,10 +1040,9 @@ class ProfessionalChunker:
                                 # Update formatted_citation with subdivision (include parent
                                 # numeral when this letra is nested under one)
                                 base_citation = chunk_metadata.get("formatted_citation", "")
-                                subdiv_type_label = "numeral" if subdiv['type'] == 'numeral' else "letra"
-                                subdiv_citation_part = f"{subdiv_type_label} {subdiv['mark']}"
-                                if subdiv.get('parent_numeral'):
-                                    subdiv_citation_part = f"numeral {subdiv['parent_numeral']}, {subdiv_citation_part}"
+                                subdiv_citation_part = self._build_subdivision_citation_part(
+                                    subdiv, *subdivision_series[subdiv_idx]
+                                )
                                 if len(subdiv_paragraphs) > 1:
                                     # Without this, every paragraph fragment of the same
                                     # subdivision would carry an identical citation, making
@@ -1069,10 +1089,9 @@ class ProfessionalChunker:
                             # Update formatted_citation with subdivision (include parent
                             # numeral when this letra is nested under one)
                             base_citation = chunk_metadata.get("formatted_citation", "")
-                            subdiv_type_label = "numeral" if subdiv['type'] == 'numeral' else "letra"
-                            subdiv_citation_part = f"{subdiv_type_label} {subdiv['mark']}"
-                            if subdiv.get('parent_numeral'):
-                                subdiv_citation_part = f"numeral {subdiv['parent_numeral']}, {subdiv_citation_part}"
+                            subdiv_citation_part = self._build_subdivision_citation_part(
+                                subdiv, *subdivision_series[subdiv_idx]
+                            )
                             sub_metadata["formatted_citation"] = f"{base_citation}, {subdiv_citation_part}"
 
                             chunks.append({
@@ -1623,7 +1642,8 @@ class ProfessionalChunker:
         norm_citation: str,
         norm_title: str,
         context: Dict,
-        article_label: str
+        article_label: str,
+        is_transitory: bool = False
     ) -> str:
         """
         Build contextual header with · (middot) separators for hierarchy.
@@ -1654,7 +1674,7 @@ class ProfessionalChunker:
             parts.append(section_full)
 
         # Add article
-        parts.append(f"Artículo {article_label}")
+        parts.append(self._article_descriptor(article_label, is_transitory)["header"])
 
         # Join with · separator
         header = " · ".join(parts)
@@ -1667,7 +1687,8 @@ class ProfessionalChunker:
         context: Dict,
         article_label: str,
         subdivision_mark: str,
-        parent_numeral: Optional[str] = None
+        parent_numeral: Optional[str] = None,
+        is_transitory: bool = False
     ) -> str:
         """
         Build contextual header for article subdivisions (fragments).
@@ -1715,7 +1736,7 @@ class ProfessionalChunker:
             parts.append(section_full)
 
         # Add article
-        parts.append(f"Artículo {article_label}")
+        parts.append(self._article_descriptor(article_label, is_transitory)["header"])
 
         # Build header with fragment indicator
         header = " · ".join(parts)
@@ -1794,11 +1815,189 @@ class ProfessionalChunker:
 
         return formatted
 
+    # Transitory provisions are labelled with spelled-out ordinals instead of a
+    # number, and BCN spells them inconsistently: the Constitución alone uses 56
+    # variants mixing case, accents and word breaks ("VIGESIMOSEGUNDA",
+    # "VIGÉSIMO OCTAVA", "VIGÉSIMOCUARTA", "Trigésima octava"). Stems are matched
+    # accent- and gender-insensitively so all of them resolve to one ordinal.
+    _ORDINAL_TENS_STEMS = {
+        'decim': 10, 'vigesim': 20, 'trigesim': 30, 'cuadragesim': 40,
+        'quincuagesim': 50, 'sexagesim': 60, 'septuagesim': 70,
+        'octogesim': 80, 'nonagesim': 90,
+    }
+    _ORDINAL_UNIT_STEMS = {
+        'primer': 1, 'segund': 2, 'tercer': 3, 'cuart': 4, 'quint': 5,
+        'sext': 6, 'septim': 7, 'octav': 8, 'noven': 9,
+    }
+    _ORDINAL_TENS_WORDS = {
+        10: 'décima', 20: 'vigésima', 30: 'trigésima', 40: 'cuadragésima',
+        50: 'quincuagésima', 60: 'sexagésima', 70: 'septuagésima',
+        80: 'octogésima', 90: 'nonagésima',
+    }
+    _ORDINAL_UNIT_WORDS = {
+        1: 'primera', 2: 'segunda', 3: 'tercera', 4: 'cuarta', 5: 'quinta',
+        6: 'sexta', 7: 'séptima', 8: 'octava', 9: 'novena',
+    }
+
+    @classmethod
+    def _spanish_ordinal_to_int(cls, label: str) -> Optional[int]:
+        """
+        Ordinal value of a spelled-out Spanish ordinal ("CUADRAGÉSIMA PRIMERA" -> 41).
+
+        Returns None when the label is not a recognisable ordinal, so callers can
+        fall back to the raw label rather than invent a number.
+        """
+        if not label:
+            return None
+
+        normalized = unicodedata.normalize('NFKD', label).encode('ascii', 'ignore').decode()
+        normalized = re.sub(r'[^a-z]', '', normalized.lower())
+        if not normalized:
+            return None
+
+        for stem, tens in cls._ORDINAL_TENS_STEMS.items():
+            if not normalized.startswith(stem):
+                continue
+            remainder = normalized[len(stem):]
+            # "decima" is 10; "decimoprimera"/"decimoctava" carry a unit, with the
+            # gender vowel either kept ("vigesimo|cuarta") or absorbed ("decim|octava")
+            if remainder in ('', 'o', 'a'):
+                return tens
+            candidates = [remainder]
+            if remainder[:1] in ('o', 'a'):
+                candidates.append(remainder[1:])
+            for candidate in candidates:
+                for unit_stem, unit in cls._ORDINAL_UNIT_STEMS.items():
+                    if candidate.startswith(unit_stem):
+                        return tens + unit
+            return tens
+
+        for unit_stem, unit in cls._ORDINAL_UNIT_STEMS.items():
+            if normalized.startswith(unit_stem):
+                return unit
+
+        return None
+
+    @classmethod
+    def _spanish_ordinal_words(cls, value: int) -> Optional[str]:
+        """Canonical feminine spelling of an ordinal ("41" -> "cuadragésima primera")."""
+        if value in cls._ORDINAL_UNIT_WORDS:
+            return cls._ORDINAL_UNIT_WORDS[value]
+        tens, unit = (value // 10) * 10, value % 10
+        if tens not in cls._ORDINAL_TENS_WORDS:
+            return None
+        if unit == 0:
+            return cls._ORDINAL_TENS_WORDS[tens]
+        return f"{cls._ORDINAL_TENS_WORDS[tens]} {cls._ORDINAL_UNIT_WORDS[unit]}"
+
+    @classmethod
+    def _article_descriptor(cls, article_label: str, is_transitory: bool) -> Dict:
+        """
+        How an article is named in the embedded header and in the citation.
+
+        Permanent articles keep "Artículo 19" / "art. 19". Transitory provisions
+        need three fixes for legal lookups:
+        - "art. PRIMERA" is not a citable reference; the correct form is
+          "disposición transitoria primera".
+        - the word "transitoria" only lived in the is_transitory metadata flag,
+          which the embedding never sees, so a lawyer searching "cuadragésima
+          primera transitoria" had no anchor in the text.
+        - the numeric alias lawyers actually type ("art. 41 transitorio") was
+          nowhere in the document.
+        """
+        if not is_transitory:
+            return {
+                "header": f"Artículo {article_label}",
+                "citation": f"art. {article_label}",
+                "ordinal": None,
+                "normalized_label": article_label,
+            }
+
+        ordinal = cls._spanish_ordinal_to_int(article_label)
+        words = cls._spanish_ordinal_words(ordinal) if ordinal else None
+
+        if not words:
+            logger.debug("transitory_ordinal_unparsed", article_label=article_label)
+            name = f"disposición transitoria {article_label}"
+            return {
+                "header": name.capitalize(),
+                "citation": name,
+                "ordinal": ordinal,
+                "normalized_label": article_label,
+            }
+
+        name = f"disposición transitoria {words} (art. {ordinal} transitorio)"
+        return {
+            "header": name.capitalize(),
+            "citation": name,
+            "ordinal": ordinal,
+            "normalized_label": words.title(),
+        }
+
+    @staticmethod
+    def _subdivision_sort_value(mark: str) -> Optional[int]:
+        """Ordinal value of a subdivision mark ("3.-" -> 3, "c)" -> 3)."""
+        number = re.search(r'\d+', mark)
+        if number:
+            return int(number.group())
+        letter = re.search(r'[a-záéíóúñ]', mark.lower())
+        if letter:
+            return ord(letter.group())
+        return None
+
+    def _assign_subdivision_series(self, subdivisions: List[Dict]) -> List[tuple]:
+        """
+        Numbers restarted subdivision sequences inside a single article.
+
+        Some articles carry two independent lists that both run "1." to "5."
+        (Constitución transitory Art. 144 lists the convocation rules and then the
+        indigenous-candidacy rules), so the mark alone is not a unique address and
+        the citations of both lists collide. Sequences are tracked per
+        (type, parent numeral) group, and a group's numbering going backwards or
+        repeating marks the start of a new series.
+
+        Returns one (series_number, series_total) pair per subdivision, where the
+        total is that subdivision's own group total, so single-series articles get
+        (1, 1) and stay unchanged.
+        """
+        assigned = []
+        state = {}  # group key -> (current series, last ordinal seen)
+
+        for subdiv in subdivisions:
+            key = (subdiv.get('type'), subdiv.get('parent_numeral'))
+            ordinal = self._subdivision_sort_value(subdiv.get('mark', ''))
+            current, last = state.get(key, (1, None))
+
+            if ordinal is not None and last is not None and ordinal <= last:
+                current += 1
+
+            state[key] = (current, ordinal if ordinal is not None else last)
+            assigned.append((key, current))
+
+        totals = {}
+        for key, current in assigned:
+            totals[key] = max(totals.get(key, 0), current)
+
+        return [(current, totals[key]) for key, current in assigned]
+
+    def _build_subdivision_citation_part(
+        self, subdiv: Dict, series_number: int, series_total: int
+    ) -> str:
+        """Citation fragment for a subdivision, e.g. "numeral 1. (serie 2 de 2)"."""
+        subdiv_type_label = "numeral" if subdiv['type'] == 'numeral' else "letra"
+        part = f"{subdiv_type_label} {subdiv['mark']}"
+        if subdiv.get('parent_numeral'):
+            part = f"numeral {subdiv['parent_numeral']}, {part}"
+        if series_total > 1:
+            part += f" (serie {series_number} de {series_total})"
+        return part
+
     def _build_formatted_citation(
         self,
         norm_citation: str,
         article_label: str,
-        context: Dict
+        context: Dict,
+        is_transitory: bool = False
     ) -> str:
         """
         Build formal legal citation.
@@ -1828,7 +2027,9 @@ class ProfessionalChunker:
 
         # Use "art." instead of "Artículo" (formal citation style)
         # Preserve original case of article_label (no .lower() or .upper())
-        citation_parts.append(f"art. {article_label}")
+        citation_parts.append(
+            self._article_descriptor(article_label, is_transitory)["citation"]
+        )
 
         return ", ".join(citation_parts)
 

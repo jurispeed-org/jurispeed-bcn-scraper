@@ -13,6 +13,9 @@ Usage:
 
     # Test with limit
     python run_indexer.py --limit 100 --instance-id test-indexer
+
+    # Index specific norms only (e.g. after re-scraping them)
+    python run_indexer.py --norm-id 242302 --instance-id reindex-1
 """
 
 import asyncio
@@ -20,6 +23,7 @@ import argparse
 import structlog
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -117,6 +121,7 @@ class ProductionIndexerRunner:
         prefix: str = None,
         limit: int = None,
         checkpoint_every: int = 100,
+        s3_keys: Optional[List[str]] = None,
     ) -> None:
         """
         Run indexing with checkpoint and quota management.
@@ -125,6 +130,7 @@ class ProductionIndexerRunner:
             prefix: S3 prefix to list documents (default: normativabcn/originals/)
             limit: Max documents to process (optional)
             checkpoint_every: Save checkpoint every N docs
+            s3_keys: Explicit keys to index; skips listing the prefix
         """
         try:
             logger.info(
@@ -133,10 +139,12 @@ class ProductionIndexerRunner:
                 s3_bucket=self.s3_bucket,
                 prefix=prefix,
                 limit=limit,
+                explicit_keys=len(s3_keys) if s3_keys else 0,
             )
 
-            # List documents from S3
-            s3_keys = self.indexer.list_documents_from_s3(prefix)
+            # List documents from S3 unless specific keys were requested
+            if not s3_keys:
+                s3_keys = self.indexer.list_documents_from_s3(prefix)
 
             if limit:
                 s3_keys = s3_keys[:limit]
@@ -300,6 +308,18 @@ def main():
         help="Max number of documents to process (for testing)",
     )
     parser.add_argument(
+        "--norm-id",
+        type=int,
+        nargs="+",
+        help="Index only these norm IDs (resolved to S3 keys), instead of the whole prefix",
+    )
+    parser.add_argument(
+        "--s3-key",
+        type=str,
+        nargs="+",
+        help="Index only these exact S3 keys, instead of the whole prefix",
+    )
+    parser.add_argument(
         "--checkpoint-every",
         type=int,
         default=100,
@@ -333,12 +353,22 @@ def main():
             start_idx=start_idx,
         )
 
+    # Resolve explicit targets, if any. Keys are built the same way the scraper
+    # builds them, so --norm-id and --s3-key are interchangeable.
+    s3_keys = list(args.s3_key) if args.s3_key else []
+    if args.norm_id:
+        s3_keys += [
+            f"{config.lexintel.knowledge_id}/originals/bcn-{norm_id}.json"
+            for norm_id in args.norm_id
+        ]
+
     # Run indexer
     try:
         runner.run_indexing(
             prefix=args.prefix,
             limit=args.limit,
             checkpoint_every=args.checkpoint_every,
+            s3_keys=s3_keys or None,
         )
         logger.info("indexer_finished_successfully", instance_id=args.instance_id)
         sys.exit(0)

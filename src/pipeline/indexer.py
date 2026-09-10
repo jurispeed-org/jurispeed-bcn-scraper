@@ -158,6 +158,14 @@ class ProductionIndexer:
                     "norm_number": doc_data.get("norm_number"),
                     "norm_id": str(norm_id),
                     "article_label": metadata.get("article_label"),
+                    # Numeric form of the article label, for range filters and
+                    # ordering ("articles 20 to 25"). Not unique on its own: art. 1
+                    # and the 1st transitory provision are both 1, so filters must
+                    # pair it with is_transitory.
+                    "article_number": metadata.get("article_number"),
+                    # Canonical spelling of the label, since BCN's own spelling of
+                    # transitory ordinals is inconsistent.
+                    "article_label_normalized": metadata.get("article_label_normalized"),
                     "in_force": metadata.get("in_force"),
                     "force_status": metadata.get("force_status"),
                     "is_transitory": metadata.get("is_transitory", False),

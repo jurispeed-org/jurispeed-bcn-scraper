@@ -5,10 +5,12 @@ Uses headless browser to render dynamic content.
 """
 
 import asyncio
+import html
 import random
+import re
 import structlog
 import aiohttp
-from typing import Optional
+from typing import Dict, Optional, Set
 from core.models import ChileanLegalNorm, ScraperStats
 from core.xml_parser import BCNXMLParser
 from utils.config import ScraperConfig
@@ -28,6 +30,35 @@ class BCNPlaywrightScraper:
     - Retry logic
     - Rate limiting
     """
+
+    # BCN renders the XML through a fixed-width layout engine that overflows on
+    # articles carrying dense amendment history, silently cutting <Texto>
+    # mid-word (e.g. Art. 107 of the Constitution ends at "disposició").
+    # Which articles overflow depends on whether notaPIE=1 injects note markers,
+    # so the two variants of the same norm are truncated in DIFFERENT articles:
+    # with notes, Arts. 19/107 and transitoria 41 are cut; without notes, the
+    # transitory Art. 144 and transitoria QUINTA are cut instead. Neither
+    # variant is authoritative, so we keep the note-bearing one as the base
+    # (its notes carry real legal cross-references) and repair the casualties
+    # from the note-free variant.
+    _STRUCTURE_PATTERN = re.compile(
+        r'<EstructuraFuncional(?P<attrs>[^>]*)>\s*<Texto>(?P<text>.*?)</Texto>',
+        re.DOTALL,
+    )
+    _ATTR_PATTERN = re.compile(r'(\w+)="([^"]*)"')
+    # Editorial notes are appended after the body, behind a bare "NOTA" line
+    _NOTE_BLOCK_PATTERN = re.compile(r'\n[ \t]*\n[ \t]*NOTAS?[ \t]*\n')
+    # A complete Chilean legal article always closes on sentence-terminating
+    # punctuation. Note that "º" is excluded on purpose: Art. 19 truncates on a
+    # dangling "20º", which would otherwise look like a legitimate ending.
+    _SENTENCE_TERMINATORS = '.;:!?)"”'
+    _REPAIRABLE_PART_TYPES = {"Artículo", "Disposición Transitoria"}
+    # Repealed articles are legitimately a bare marker with no closing period
+    _REPEAL_MARKER_PATTERN = re.compile(
+        r'^\s*(?:Art\S*\s*[\wº°.\-]*\s*[.\-]*\s*)?'
+        r'(?:Derogado|Suprimido|Eliminado|Sin efecto)\s*\.?\s*$',
+        re.IGNORECASE,
+    )
 
     def __init__(self, config: ScraperConfig):
         self.config = config
@@ -114,7 +145,133 @@ class BCNPlaywrightScraper:
         """Initialize scraper (no-op for backward compatibility)."""
         logger.info("scraper_ready", mode="xml_only")
 
-    async def _fetch_xml(self, norm_id: int, timeout: Optional[int] = None) -> Optional[str]:
+    def _split_note_block(self, text: str) -> tuple:
+        """Splits an article's <Texto> into (body, editorial_note_block)."""
+        match = self._NOTE_BLOCK_PATTERN.search(text)
+        if not match:
+            return text, ""
+        return text[:match.start()], text[match.start():]
+
+    def _is_truncated(self, raw_text: str) -> bool:
+        """
+        True if an article's text was cut off mid-sentence.
+
+        Margin notes are stripped first, otherwise the trailing amendment
+        reference in the right-hand column would look like the end of the text.
+        """
+        body, _ = self._split_note_block(html.unescape(raw_text))
+        body = self.xml_parser._strip_margin_notes(body).strip()
+        if not body or self._REPEAL_MARKER_PATTERN.match(body):
+            return False
+        return body[-1] not in self._SENTENCE_TERMINATORS
+
+    def _iter_repairable_articles(self, xml_content: str):
+        """Yields (part_id, match) for article-like parts that can be repaired."""
+        for match in self._STRUCTURE_PATTERN.finditer(xml_content):
+            # BCN escapes non-ASCII in attributes too (tipoParte="Art&#237;culo")
+            attrs = {
+                name: html.unescape(value)
+                for name, value in self._ATTR_PATTERN.findall(match.group("attrs"))
+            }
+            part_id = attrs.get("idParte")
+            if part_id and attrs.get("tipoParte") in self._REPAIRABLE_PART_TYPES:
+                yield part_id, match
+
+    def _find_truncated_articles(self, xml_content: str) -> Set[str]:
+        return {
+            part_id
+            for part_id, match in self._iter_repairable_articles(xml_content)
+            if self._is_truncated(match.group("text"))
+        }
+
+    def _article_bodies(self, xml_content: str) -> Dict[str, str]:
+        return {
+            part_id: match.group("text")
+            for part_id, match in self._iter_repairable_articles(xml_content)
+        }
+
+    def _merge_article_bodies(
+        self, base_xml: str, donor_bodies: Dict[str, str], truncated: Set[str], norm_id: int
+    ) -> str:
+        """
+        Replaces each truncated article body in base_xml with the donor's version,
+        keeping the base's editorial note block (the donor has no notes).
+
+        Only substitutes when the donor is actually complete and longer, so a
+        donor that is truncated at the same place leaves the base untouched.
+        """
+        pieces = []
+        cursor = 0
+        repaired, unrecoverable = [], []
+
+        for part_id, match in self._iter_repairable_articles(base_xml):
+            if part_id not in truncated:
+                continue
+
+            donor_text = donor_bodies.get(part_id)
+            if donor_text is None:
+                unrecoverable.append(part_id)
+                continue
+
+            donor_body, _ = self._split_note_block(donor_text)
+            base_body, base_note = self._split_note_block(match.group("text"))
+
+            if self._is_truncated(donor_body) or len(donor_body) <= len(base_body):
+                unrecoverable.append(part_id)
+                continue
+
+            start, end = match.span("text")
+            pieces.append(base_xml[cursor:start])
+            pieces.append(donor_body + base_note)
+            cursor = end
+            repaired.append(part_id)
+
+        if not repaired:
+            logger.warning(
+                "xml_truncation_unrecoverable",
+                norm_id=norm_id,
+                part_ids=sorted(unrecoverable),
+                reason="donor variant truncated at the same point (BCN source defect)",
+            )
+            return base_xml
+
+        pieces.append(base_xml[cursor:])
+        logger.info(
+            "xml_truncation_repaired",
+            norm_id=norm_id,
+            repaired=sorted(repaired),
+            unrecoverable=sorted(unrecoverable),
+        )
+        return "".join(pieces)
+
+    async def _repair_truncated_articles(
+        self, norm_id: int, xml_content: str, timeout: Optional[int]
+    ) -> str:
+        """
+        Detects articles truncated by BCN's renderer and patches them from the
+        note-free variant of the same norm.
+
+        Costs one extra request, and only for norms that actually have a
+        truncation, so most documents are unaffected.
+        """
+        truncated = self._find_truncated_articles(xml_content)
+        if not truncated:
+            return xml_content
+
+        logger.info("xml_truncation_detected", norm_id=norm_id, part_ids=sorted(truncated))
+
+        donor_xml = await self._fetch_xml(norm_id, timeout=timeout, include_notes=False)
+        if not donor_xml:
+            logger.warning("xml_donor_fetch_failed", norm_id=norm_id, part_ids=sorted(truncated))
+            return xml_content
+
+        return self._merge_article_bodies(
+            xml_content, self._article_bodies(donor_xml), truncated, norm_id
+        )
+
+    async def _fetch_xml(
+        self, norm_id: int, timeout: Optional[int] = None, include_notes: bool = True
+    ) -> Optional[str]:
         """
         Fetch XML from BCN's obtxml service using direct HTTP.
 
@@ -124,11 +281,16 @@ class BCNPlaywrightScraper:
         Args:
             norm_id: BCN norm ID
             timeout: Custom timeout in seconds (overrides config)
+            include_notes: Request editorial notes (notaPIE=1) and repair any
+                article BCN truncates as a side effect. Set False to fetch the
+                note-free variant used as the repair donor (avoids recursion).
 
         Returns:
             XML content or None if failed
         """
-        url = f"http://www.leychile.cl/Consulta/obtxml?opt=7&idNorma={norm_id}&notaPIE=1"
+        url = f"http://www.leychile.cl/Consulta/obtxml?opt=7&idNorma={norm_id}"
+        if include_notes:
+            url += "&notaPIE=1"
         effective_timeout = timeout or self.config.timeout_seconds
 
         headers = {
@@ -169,6 +331,12 @@ class BCNPlaywrightScraper:
                         return None
 
                     logger.debug("xml_fetch_success", norm_id=norm_id, xml_length=len(xml_content))
+
+                    if include_notes:
+                        xml_content = await self._repair_truncated_articles(
+                            norm_id, xml_content, timeout
+                        )
+
                     return xml_content
 
         except asyncio.TimeoutError:

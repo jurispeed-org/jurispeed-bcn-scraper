@@ -21,8 +21,30 @@ REQUIRED_TOP_FIELDS = {"norm_id", "norm_type", "norm_number", "formal_citation",
                         "chunks", "total_chunks", "total_articles", "vigentes"}
 VALID_FORCE_STATUS = {"active", "repealed", "deferred"}
 REMOVED_METADATA_FIELDS = {"literal_text", "subdivisions", "path"}
-MIN_CONTENT_AFTER_HEADER = 50  # chars
+MIN_CONTENT_AFTER_HEADER = 20  # chars (Constitución Art. 4 is a legitimate 49-char article)
 MAX_ALLOWED_RECONSTRUCTION_DIFF = 15  # chars, accounts for whitespace normalization only
+
+# A complete Chilean legal article always closes on sentence-terminating
+# punctuation. Anything else means the text was cut off -- either by BCN's own
+# XML export or by our chunking.
+SENTENCE_TERMINATORS = '.;:!?)"”'
+# Repealed/suppressed articles are legitimately a bare marker with no terminator
+REPEAL_MARKER_PATTERN = re.compile(
+    r'^\s*(?:Art[í\wi]*\.?\s*[\wº°.\-]*\s*[.\-]*\s*)?'
+    r'(?:Derogado|Suprimido|Eliminado|Sin efecto)\s*\.?\s*$',
+    re.IGNORECASE,
+)
+# BCN renders amendment history in a right-hand margin column. If any of these
+# leak into the embedded body the chunk is contaminated (and words get split).
+MARGIN_NOTE_PATTERN = re.compile(
+    r'(D\.\s*O\.\s*\d{2}\.\d{2}\.\d{4}'
+    r'|LEY\s+N[°º]?\s*[\d.]{5,}'
+    r'|CPR\s+Art\.)'
+)
+# token_count must be a believable estimate of the chunk text, not a stale or
+# defaulted number. Spanish legal prose runs ~3-6 chars/token.
+MIN_CHARS_PER_TOKEN = 1.5
+MAX_CHARS_PER_TOKEN = 12.0
 
 
 def load_all_chunk_files():
@@ -210,12 +232,182 @@ def _strip_notes(text: str) -> str:
     return text
 
 
-def _body_without_header(content: str) -> str:
+def _body_raw(content: str) -> str:
+    """Like _body_without_header but keeps surrounding whitespace, so fragments
+    can be concatenated without losing the spacing between them."""
     if "\n\n" in content:
         return content.split("\n\n", 1)[1]
     if "\n" in content:
         return content.split("\n", 1)[1]
     return content
+
+
+def _articles_by_part_id(doc):
+    """Groups chunks by the article they came from, in chunk_index order."""
+    groups = {}
+    for chunk in doc["chunks"]:
+        part_id = chunk["metadata"].get("part_id")
+        if part_id is None:
+            continue
+        groups.setdefault(str(part_id), []).append(chunk)
+    for group in groups.values():
+        group.sort(key=lambda c: c["chunk_index"])
+    return groups
+
+
+def _reconstruct_article_text(group_chunks) -> str:
+    text = "".join(_body_raw(c["content"]) for c in group_chunks)
+    return re.sub(r"\s+", " ", _strip_notes(text)).strip()
+
+
+def test_articles_not_truncated(all_docs):
+    """
+    Reconstructs each article and asserts it closes on sentence-terminating
+    punctuation.
+
+    This is the only check that can catch content truncated *at the source*:
+    BCN's XML export silently cuts some articles mid-word (e.g. Constitución
+    Art. 107 ends at "disposició", Art. 19 ends at a dangling "20º" dropping
+    numerals 20-26). test_no_content_lost_vs_original_xml compares our output
+    against that same truncated XML, so it passes on already-lost text --
+    it validates fidelity to the fetch, not completeness of the article.
+    """
+    for filepath, doc in all_docs:
+        truncated = []
+        for part_id, group_chunks in _articles_by_part_id(doc).items():
+            statuses = {c["metadata"].get("force_status") for c in group_chunks}
+            if statuses and "active" not in statuses:
+                # Repealed/deferred articles legitimately carry no closing text
+                continue
+            text = _reconstruct_article_text(group_chunks)
+            if not text or REPEAL_MARKER_PATTERN.match(text):
+                continue
+            if text[-1] not in SENTENCE_TERMINATORS:
+                label = group_chunks[0]["metadata"].get("article_label")
+                truncated.append(f"art. {label} (part_id {part_id}) ends: ...{text[-60:]!r}")
+
+        assert not truncated, (
+            f"{filepath}: {len(truncated)} article(s) do not end on sentence-terminating "
+            f"punctuation, i.e. their text is cut off:\n  " + "\n  ".join(truncated)
+        )
+
+
+def test_no_margin_notes_in_body(all_docs):
+    """
+    BCN's XML puts amendment history ("D.O. 17.08.1989", "LEY N° 20.050") in a
+    right-hand margin column of the same <Texto> block. If _strip_margin_notes()
+    misses one it lands in the embedded text, splitting words across it and
+    polluting the vector.
+    """
+    for filepath, doc in all_docs:
+        contaminated = []
+        for chunk in doc["chunks"]:
+            match = MARGIN_NOTE_PATTERN.search(_body_without_header(chunk["content"]))
+            if match:
+                contaminated.append(
+                    f"chunk {chunk['chunk_index']} (art. {chunk['metadata'].get('article_label')}): "
+                    f"{match.group(0)!r}"
+                )
+        assert not contaminated, (
+            f"{filepath}: {len(contaminated)} chunk(s) contain unstripped BCN margin notes "
+            f"in the embedded body:\n  " + "\n  ".join(contaminated)
+        )
+
+
+def test_formatted_citation_unique(all_docs):
+    """
+    formatted_citation is what the MCP tool shows the user to identify a passage.
+    Two chunks with different text under the same citation make the answer
+    unverifiable. Catches articles that restart their numbering mid-way (e.g.
+    Constitución Art. 144 has two separate "1." to "5." lists).
+    """
+    for filepath, doc in all_docs:
+        seen = {}
+        collisions = []
+        for chunk in doc["chunks"]:
+            citation = chunk["metadata"].get("formatted_citation")
+            if not citation:
+                continue
+            idx = chunk["chunk_index"]
+            if citation in seen:
+                collisions.append(f"chunks {seen[citation]} and {idx}: {citation!r}")
+            else:
+                seen[citation] = idx
+        assert not collisions, (
+            f"{filepath}: {len(collisions)} duplicated formatted_citation(s) -- distinct "
+            f"passages are indistinguishable to the user:\n  " + "\n  ".join(collisions)
+        )
+
+
+def test_every_chunk_has_part_id(all_docs):
+    """
+    The XML cross-check tests skip chunks without part_id. Without this guard a
+    regression that stops emitting part_id would make those tests pass vacuously.
+    """
+    for filepath, doc in all_docs:
+        orphans = [c["chunk_index"] for c in doc["chunks"] if c["metadata"].get("part_id") is None]
+        assert not orphans, \
+            f"{filepath}: {len(orphans)} chunk(s) have no part_id: {orphans[:10]} " \
+            f"-- these are invisible to the XML completeness checks"
+
+
+def test_article_and_vigente_counters_match_chunks(all_docs):
+    """total_articles/vigentes are the numbers used to report progress and to
+    sanity-check production output, so they must agree with the chunks."""
+    for filepath, doc in all_docs:
+        groups = _articles_by_part_id(doc)
+        assert doc["total_articles"] == len(groups), \
+            f"{filepath}: total_articles={doc['total_articles']} but chunks cover " \
+            f"{len(groups)} distinct articles"
+
+        in_force_articles = sum(
+            1 for group in groups.values()
+            if any(c["metadata"].get("in_force") for c in group)
+        )
+        assert doc["vigentes"] == in_force_articles, \
+            f"{filepath}: vigentes={doc['vigentes']} but {in_force_articles} distinct " \
+            f"articles have in_force=True"
+        assert doc["vigentes"] <= doc["total_articles"], \
+            f"{filepath}: vigentes={doc['vigentes']} exceeds total_articles={doc['total_articles']}"
+
+
+def test_token_count_is_plausible(all_docs):
+    """A defaulted or stale token_count silently breaks embedding batch sizing
+    (29 chunks/request is tuned against it) and the daily quota accounting."""
+    for filepath, doc in all_docs:
+        for chunk in doc["chunks"]:
+            idx, tokens, length = chunk["chunk_index"], chunk["token_count"], len(chunk["content"])
+            assert tokens > 0, f"{filepath}: chunk {idx} has token_count={tokens}"
+            ratio = length / tokens
+            assert MIN_CHARS_PER_TOKEN <= ratio <= MAX_CHARS_PER_TOKEN, \
+                f"{filepath}: chunk {idx} token_count={tokens} is implausible for " \
+                f"{length} chars ({ratio:.1f} chars/token)"
+
+
+def test_no_placeholder_article_label(all_docs):
+    """
+    Regression guard: articles without <NombreParte> used to fall back to the
+    literal label "Contenido", producing citations like "art. Contenido". The
+    fallback must resolve a real name from <TituloParte>.
+    """
+    for filepath, doc in all_docs:
+        placeholders = [
+            f"chunk {c['chunk_index']}: {c['metadata'].get('formatted_citation')!r}"
+            for c in doc["chunks"]
+            if str(c["metadata"].get("article_label", "")).strip().lower() in {"contenido", "", "none"}
+        ]
+        assert not placeholders, (
+            f"{filepath}: {len(placeholders)} chunk(s) have a placeholder article_label "
+            f"instead of a real article name:\n  " + "\n  ".join(placeholders[:10])
+        )
+
+
+def test_norm_id_matches_filename(all_docs):
+    """Guards against a norm's chunks being written under another norm's S3 key."""
+    for filepath, doc in all_docs:
+        expected = os.path.basename(filepath).removeprefix("bcn-").removesuffix(".json")
+        assert str(doc["norm_id"]) == expected, \
+            f"{filepath}: norm_id={doc['norm_id']} does not match filename id {expected}"
 
 
 def test_article_count_matches_xml(all_docs):
@@ -301,7 +493,7 @@ def test_no_content_lost_vs_original_xml(all_docs):
             if part_id not in original_texts:
                 continue
             group_sorted = sorted(group_chunks, key=lambda c: c["chunk_index"])
-            reconstructed = "".join(_body_without_header(c["content"]) for c in group_sorted)
+            reconstructed = "".join(_body_raw(c["content"]) for c in group_sorted)
             reconstructed = _strip_notes(reconstructed)
 
             original_norm = re.sub(r"\s+", " ", original_texts[part_id]).strip()

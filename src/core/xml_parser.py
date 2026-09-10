@@ -38,8 +38,91 @@ class BCNXMLParser:
     # touches a line's own leading indentation).
     _MARGIN_NOTE_PATTERN = re.compile(r'(?<=\S) {4,}\S.*$', re.MULTILINE)
 
+    # When a margin note wraps onto its own physical line, or BCN pushes it to a
+    # line of its own, there is no real content before the gap -- just the note's
+    # column padding -- so the pattern above never matches it. Indentation is not
+    # a usable signal here: real body lines in the Constitution sit at 8, 10, 12,
+    # 16 and even 20 spaces, the same range as these orphan note lines (8-16).
+    # Instead require the WHOLE line to consist of note vocabulary, and to carry
+    # at least one strong signature. That keeps genuine body text that merely
+    # mentions a law ("...sistematizado de la Ley 19175,") because such a line is
+    # never note-only.
+    # Case-sensitive on purpose: BCN's margin column always uppercases the source
+    # ("LEY N° 20.050 Art."), while body text citing a law does not ("de la ley
+    # N° 18.700."). Without that distinction those wrapped body lines, which also
+    # happen to be made only of note vocabulary, would be dropped as notes.
+    _NOTE_STRONG_SIGNATURE = re.compile(
+        r'CPR\s*Art\.?|LEY\s*N?[°º]?\s*[\d.]{4,}|D\.\s*O\.|\d{2}\.\d{2}\.\d{4}'
+    )
+    # A note pushed entirely into the margin column starts far to the right of any
+    # body line. Measured over the test corpus, body lines never start past column
+    # 20 (BCN wraps the body at ~60 chars), while margin notes start at 60+; 40 sits
+    # in the empty band between the two, so it never reaches body text. This catches
+    # the wrapped note fragments that are too generic for the vocabulary rules
+    # below ("letra a) D.O.", "Nº 3 letra a)").
+    _DEEP_INDENT_NOTE_PATTERN = re.compile(r'^ {40,}\S')
+    _NOTE_ONLY_LINE_PATTERN = re.compile(
+        r'^[ \t]*(?:'
+        r'CPR|LEY|D\.\s*O\.|Art\.?|N[°º]|[úu]nico|inciso|letra|numeral|transitorio'
+        r'|bis|de|del|la|el|y|a|N|Nº|[a-z]\)'
+        r'|\d{2}\.\d{2}\.\d{4}|[\d.]+'
+        r'|[°º()\[\],;.:\-]'
+        r'|[ \t]'
+        r')+$',
+        re.IGNORECASE,
+    )
+    # A note that wraps may spill onto further lines whose own tail is too generic
+    # to recognise on its own ("unico" after "LEY N° 19.519 Art."), so those are
+    # only dropped while we are still inside a note block.
+    _NOTE_CONTINUATION_LINE_PATTERN = re.compile(
+        r'^[ \t]*(?:'
+        r'Art\.?|N[°º]|[úu]nico|inciso|letra|numeral|transitorio|bis|de|del|la|el|y|a|N|Nº'
+        r'|[a-z]\)|[\d.]+|[°º()\[\],;.:\-]|[ \t]'
+        r')+$',
+        re.IGNORECASE,
+    )
+
+    def _is_note_only_line(self, line: str) -> bool:
+        if not line.strip() or not self._NOTE_STRONG_SIGNATURE.search(line):
+            return False
+        # If the same-line rule can already split body from note, the line does
+        # carry body text and must not be dropped whole (e.g. a line holding just
+        # the closing "." of the previous paragraph plus a margin note).
+        if self._MARGIN_NOTE_PATTERN.sub('', line).strip() != line.strip():
+            return False
+        return bool(self._NOTE_ONLY_LINE_PATTERN.match(line))
+
     def _strip_margin_notes(self, text: str) -> str:
-        return self._MARGIN_NOTE_PATTERN.sub('', text)
+        """
+        Removes BCN's right-hand amendment-history column from an article body.
+
+        Handles both notes sharing a line with the body and notes occupying whole
+        lines of their own (including their wrapped continuations).
+        """
+        kept = []
+        in_note = False
+
+        for line in text.split('\n'):
+            if self._DEEP_INDENT_NOTE_PATTERN.match(line):
+                in_note = True
+                continue
+
+            if self._is_note_only_line(line):
+                in_note = True
+                continue
+
+            if in_note and line.strip() and self._NOTE_CONTINUATION_LINE_PATTERN.match(line):
+                continue
+
+            stripped = self._MARGIN_NOTE_PATTERN.sub('', line)
+            # A same-line note also opens a note block: its wrapped tail lands on
+            # the following lines.
+            in_note = stripped != line
+            # Removing a note leaves the column padding that separated it from the
+            # body behind as trailing spaces.
+            kept.append(stripped.rstrip())
+
+        return '\n'.join(kept)
 
     def _find_article_structures(self, root: ET.Element) -> List[ET.Element]:
         """Find all EstructuraFuncional elements that represent articles (regular or transitory)."""
@@ -504,7 +587,25 @@ class BCNXMLParser:
                     )
                     if has_nested_articles:
                         continue
-                    article_label = f"Artículo {article_number}" if article_number else "Contenido"
+
+                    # Some transitory provisions have an empty <NombreParte> but carry
+                    # their ordinal name in <TituloParte> instead (e.g. "DISPOSICIÓN
+                    # TRANSITORIA QUINCUAGÉSIMA PRIMERA TRANSITORIO"). Strip the
+                    # boilerplate wrapper so the label matches siblings that do have a
+                    # NombreParte (e.g. "QUINCUAGÉSIMA PRIMERA").
+                    titulo_elem = structure.find('.//ns:TituloParte', self.NS)
+                    titulo_text = titulo_elem.text.strip() if titulo_elem is not None and titulo_elem.text else None
+                    if titulo_text:
+                        titulo_label = re.sub(
+                            r'^DISPOSICI[OÓ]N TRANSITORIA\s+', '', titulo_text, flags=re.IGNORECASE
+                        )
+                        titulo_label = re.sub(
+                            r'\s+TRANSITORIO$', '', titulo_label, flags=re.IGNORECASE
+                        ).strip()
+                        article_label = titulo_label if titulo_label else None
+
+                    if not article_label:
+                        article_label = f"Artículo {article_number}" if article_number else "Contenido"
 
                 # 1. Legacy: has "DEL ART" in name
                 is_nested_legacy = 'DEL ART' in article_label.upper()
@@ -870,6 +971,36 @@ class BCNXMLParser:
             logger.error("structural_context_extraction_failed", norm_id=norm_id, error=str(e))
             return {}
 
+    def _container_display_title(self, container: ET.Element, titulo_parte: str) -> str:
+        """
+        Prefer the heading BCN prints inside the container's own <Texto> when it is a
+        longer form of <TituloParte>.
+
+        <TituloParte> is normalized by BCN and can be identical for two different
+        containers (Decreto 49 has two chapters both labelled "DISPOSICIONES
+        TRANSITORIAS"), while the printed heading distinguishes them
+        ("DISPOSICIONES TRANSITORIAS DEL PRESENTE DECRETO"). Only extensions of
+        the metadata label are accepted, so a divergent heading never overrides it.
+        """
+        texto_elem = container.find('./ns:Texto', self.NS)
+        if texto_elem is None or not texto_elem.text:
+            return titulo_parte
+
+        # The heading is the first block of the <Texto>, before the NOTA marker
+        # BCN appends at the right margin and before the note body itself.
+        heading_block = texto_elem.text.split('NOTA')[0]
+        heading = ' '.join(heading_block.split()).strip(' :.-')
+        if not heading:
+            return titulo_parte
+
+        def key(value: str) -> str:
+            return ' '.join(value.split()).lower()
+
+        if key(heading) != key(titulo_parte) and key(heading).startswith(key(titulo_parte)):
+            return heading
+
+        return titulo_parte
+
     def _find_structural_ancestors(self, element: ET.Element, root: ET.Element) -> Dict:
         """
         Walk up the XML tree to find Libro, Titulo, Parrafo ancestors.
@@ -891,7 +1022,7 @@ class BCNXMLParser:
                 # Read <TituloParte> from Metadata (this is where BCN stores the full name)
                 title_elem = parent.find('.//ns:TituloParte', self.NS)
                 if title_elem is not None and title_elem.text:
-                    full_text = title_elem.text.strip()
+                    full_text = self._container_display_title(parent, title_elem.text.strip())
 
                     # Parse the full text to separate ordinal from name
                     # Examples:
@@ -920,13 +1051,22 @@ class BCNXMLParser:
 
                     elif type_val == 'Capítulo':
                         # Handle chapters (common in Constitución)
-                        # Extract "Capítulo I" and "BASES DE LA INSTITUCIONALIDAD"
-                        parts = full_text.split(maxsplit=2)
-                        if len(parts) >= 2:
-                            ordinal = f"{parts[0]} {parts[1]}"
-                            name = parts[2] if len(parts) > 2 else ""
-                            context['title_ordinal'] = ordinal
-                            context['title_name'] = name
+                        # "Capítulo I BASES DE LA INSTITUCIONALIDAD" -> "Capítulo I" + name
+                        # Chapters whose label is not "Capítulo <ordinal>" (e.g.
+                        # "DISPOSICIONES TRANSITORIAS DEL PRESENTE DECRETO") are kept
+                        # whole: splitting them on the second word would drop exactly
+                        # the words that tell two same-named chapters apart.
+                        match = re.match(
+                            r'^(Cap[íi]tulo\s+[\dIVXLC]+(?:\s+(?:bis|ter|quater))?)\s*[:.\-–]?\s*(.*)$',
+                            full_text,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            context['title_ordinal'] = match.group(1).strip()
+                            context['title_name'] = match.group(2).strip()
+                        else:
+                            context['title_ordinal'] = full_text
+                            context['title_name'] = ""
 
                     elif type_val == 'Párrafo':
                         # Extract "§1 bis" and "Del femicidio"
