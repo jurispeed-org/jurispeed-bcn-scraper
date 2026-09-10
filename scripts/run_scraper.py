@@ -11,6 +11,9 @@ Usage:
 
     # Resume and continue to new end
     python run_scraper.py --resume --end 100000 --instance-id ec2-instance-1
+
+    # Scrape an explicit, non-contiguous list of norm IDs (one per line)
+    python run_scraper.py --ids-file deployment/decretos_ids.txt --instance-id decretos-1
 """
 
 import asyncio
@@ -98,28 +101,32 @@ class ProductionScraper:
 
     async def scrape_with_storage(
         self,
-        start_id: int,
-        end_id: int,
+        norm_ids: list[int],
     ) -> None:
         """
-        Scrape range with S3 storage and checkpointing.
+        Scrape a list of norm IDs with S3 storage and checkpointing.
+
+        The list does not need to be contiguous: a range of IDs and an
+        explicit, scattered list (e.g. all decretos matched by type) are
+        both just a `list[int]` here. The checkpoint stores the *position*
+        in the list rather than the norm_id itself, since a non-contiguous
+        list has no "next id" to resume from.
 
         Args:
-            start_id: Starting norm ID
-            end_id: Ending norm ID (inclusive)
+            norm_ids: Norm IDs to scrape, in the order they should be processed
         """
+        idx = -1
+        total = len(norm_ids)
         try:
             await self.scraper.start()
 
             logger.info(
                 "scraping_started",
                 instance_id=self.instance_id,
-                start_id=start_id,
-                end_id=end_id,
-                total_range=end_id - start_id + 1,
+                total_ids=total,
             )
 
-            for norm_id in range(start_id, end_id + 1):
+            for idx, norm_id in enumerate(norm_ids):
                 # Skip if already scraped (DISABLED - starting fresh)
                 # if norm_id in self.skip_ids:
                 #     logger.debug("skipping_already_scraped", norm_id=norm_id)
@@ -139,17 +146,17 @@ class ProductionScraper:
                     error_reason = self.scraper.last_error or "Unknown error"
                     self.norm_tracker.mark_failed(norm_id, error_reason)
 
-                if (norm_id - start_id + 1) % self.config.scraper.checkpoint_every == 0:
+                if (idx + 1) % self.config.scraper.checkpoint_every == 0:
                     stats = self.scraper.get_stats()
-                    self.checkpoint_mgr.save(norm_id, stats)
+                    self.checkpoint_mgr.save(idx, stats, metadata={"last_norm_id": norm_id})
 
-                    progress_pct = ((norm_id - start_id + 1) / (end_id - start_id + 1)) * 100
+                    progress_pct = ((idx + 1) / total) * 100
 
                     logger.info(
                         "checkpoint_saved",
                         instance_id=self.instance_id,
                         current_id=norm_id,
-                        progress=f"{norm_id - start_id + 1}/{end_id - start_id + 1}",
+                        progress=f"{idx + 1}/{total}",
                         progress_pct=f"{progress_pct:.1f}%",
                         success_rate=f"{stats.success_rate:.1f}%",
                     )
@@ -166,8 +173,9 @@ class ProductionScraper:
 
         except KeyboardInterrupt:
             logger.warning("scraping_interrupted_by_user", instance_id=self.instance_id)
-            stats = self.scraper.get_stats()
-            self.checkpoint_mgr.save(norm_id, stats)
+            if idx >= 0:
+                stats = self.scraper.get_stats()
+                self.checkpoint_mgr.save(idx, stats, metadata={"last_norm_id": norm_ids[idx]})
             raise
 
         except Exception as e:
@@ -395,10 +403,11 @@ class ProductionScraper:
 
     def get_resume_point(self) -> int | None:
         """
-        Get last checkpoint ID to resume from.
+        Get last checkpoint position to resume from.
 
         Returns:
-            Last processed ID or None if no checkpoint
+            Last processed position (norm_id for range mode, list index for
+            --ids-file mode) or None if no checkpoint
         """
         checkpoint = self.checkpoint_mgr.load()
 
@@ -448,6 +457,36 @@ def load_skip_ids(file_path: str = "deployment/priority_norms.txt") -> set[int]:
     return skip_ids
 
 
+def load_norm_ids(file_path: str) -> list[int]:
+    """
+    Load an explicit, ordered list of norm IDs to scrape (one per line).
+
+    Used for type-based batches (e.g. all decretos matched ahead of time)
+    where the IDs are scattered across the whole BCN ID space, so a
+    --start/--end range would waste most of the run on other norm types.
+
+    Args:
+        file_path: Path to file with one norm ID per line
+
+    Returns:
+        Norm IDs in file order, de-duplicated
+    """
+    seen = set()
+    norm_ids = []
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and line.isdigit():
+                norm_id = int(line)
+                if norm_id not in seen:
+                    seen.add(norm_id)
+                    norm_ids.append(norm_id)
+
+    logger.info("norm_ids_loaded", file=file_path, count=len(norm_ids))
+    return norm_ids
+
+
 async def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -462,8 +501,13 @@ async def main():
     parser.add_argument(
         "--end",
         type=int,
-        required=True,
-        help="Ending norm ID (inclusive)",
+        help="Ending norm ID (inclusive). Required unless --ids-file is given.",
+    )
+    parser.add_argument(
+        "--ids-file",
+        type=str,
+        help="File with an explicit, one-per-line list of norm IDs to scrape "
+             "(e.g. a type-based batch). Mutually exclusive with --start/--end.",
     )
     parser.add_argument(
         "--instance-id",
@@ -490,6 +534,19 @@ async def main():
 
     args = parser.parse_args()
 
+    if args.ids_file and (args.start or args.end):
+        logger.error(
+            "conflicting_arguments",
+            message="--ids-file is mutually exclusive with --start/--end",
+        )
+        sys.exit(1)
+    if not args.ids_file and not args.end:
+        logger.error(
+            "missing_range_or_ids_file",
+            message="Provide --end (range mode) or --ids-file (explicit list mode)",
+        )
+        sys.exit(1)
+
     # DISABLED: Starting fresh, no skip list
     # skip_ids = load_skip_ids(args.skip_file)
     skip_ids = set()
@@ -513,43 +570,60 @@ async def main():
         skip_ids=skip_ids,
     )
 
-    if args.resume:
-        last_id = scraper.get_resume_point()
-        if last_id:
-            start_id = last_id + 1  # Continue from next ID
-            logger.info(
-                "resuming_scraping",
-                instance_id=args.instance_id,
-                resume_from_id=start_id,
-            )
+    if args.ids_file:
+        norm_ids = load_norm_ids(args.ids_file)
+        if args.resume:
+            last_idx = scraper.get_resume_point()
+            if last_idx is not None:
+                norm_ids = norm_ids[last_idx + 1:]
+                logger.info(
+                    "resuming_scraping",
+                    instance_id=args.instance_id,
+                    resume_from_idx=last_idx + 1,
+                    remaining=len(norm_ids),
+                )
+            else:
+                logger.info("no_checkpoint_starting_fresh", instance_id=args.instance_id)
+    else:
+        if args.resume:
+            last_id = scraper.get_resume_point()
+            if last_id:
+                start_id = last_id + 1  # Continue from next ID
+                logger.info(
+                    "resuming_scraping",
+                    instance_id=args.instance_id,
+                    resume_from_id=start_id,
+                )
+            else:
+                start_id = args.start or 1
+                logger.info(
+                    "no_checkpoint_starting_fresh",
+                    instance_id=args.instance_id,
+                    start_id=start_id,
+                )
         else:
             start_id = args.start or 1
             logger.info(
-                "no_checkpoint_starting_fresh",
+                "starting_fresh",
                 instance_id=args.instance_id,
                 start_id=start_id,
             )
-    else:
-        start_id = args.start or 1
-        logger.info(
-            "starting_fresh",
-            instance_id=args.instance_id,
-            start_id=start_id,
-        )
 
-    end_id = args.end
+        end_id = args.end
 
-    if start_id > end_id:
-        logger.error(
-            "invalid_range",
-            start_id=start_id,
-            end_id=end_id,
-            message="Start ID must be <= End ID",
-        )
-        sys.exit(1)
+        if start_id > end_id:
+            logger.error(
+                "invalid_range",
+                start_id=start_id,
+                end_id=end_id,
+                message="Start ID must be <= End ID",
+            )
+            sys.exit(1)
+
+        norm_ids = list(range(start_id, end_id + 1))
 
     try:
-        await scraper.scrape_with_storage(start_id, end_id)
+        await scraper.scrape_with_storage(norm_ids)
         logger.info("scraper_finished_successfully", instance_id=args.instance_id)
         sys.exit(0)
 
