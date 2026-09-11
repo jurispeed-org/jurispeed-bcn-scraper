@@ -916,11 +916,19 @@ class ProfessionalChunker:
                 chunk_metadata["binary_content"] = binary_info
                 chunk_metadata["content_complete"] = False
 
-                # Add textual note to warn users
+                # Warn inside the chunk text, not only in metadata: a model that
+                # only sees the text would otherwise describe the article as if
+                # the annex did not exist. The link is the article-level deep
+                # link, which opens the attachment in BCN's official viewer.
+                attachments = binary_info.get("attachments") or []
+                names = ", ".join(
+                    a["filename"] for a in attachments if a.get("filename")
+                )
+                detail = f" ({names})" if names else ""
                 binary_note = (
-                    "\n\n[NOTA: Este artículo contiene contenido binario (tabla o imagen) "
-                    "no indexado. Para ver el contenido completo, consulte el documento "
-                    "original en el sitio oficial de la Biblioteca del Congreso Nacional.]"
+                    f"\n\n[NOTA: Este artículo contiene contenido binario "
+                    f"(tabla o imagen escaneada) no indexado{detail}. "
+                    f"Para consultarlo, ver el documento oficial: {article_url}]"
                 )
                 full_text += binary_note
 

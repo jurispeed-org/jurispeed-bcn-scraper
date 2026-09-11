@@ -66,7 +66,11 @@ class ChileanLegalNorm(BaseModel):
 
     norm_type: NormType = Field(..., description="Type of legal instrument")
     norm_number: str = Field(..., min_length=1, description="Official norm number")
-    title: str = Field(..., min_length=10, max_length=500)
+    # No upper bound: BCN titles are free prose and legitimately run past 500
+    # chars (decretos that enumerate what they modify). Capping them rejected
+    # valid norms outright. `summary`, which is derived from the title, is
+    # truncated at the parser instead of validated away.
+    title: str = Field(..., min_length=10)
 
     publication_date: date = Field(..., description="Official publication date (Diario Oficial)")
     promulgation_date: Optional[date] = Field(
@@ -95,7 +99,11 @@ class ChileanLegalNorm(BaseModel):
         max_length=2000,
         description="Executive summary for RAG retrieval",
     )
-    full_content: str = Field(..., min_length=100, description="Complete legal text")
+    # Floor guards against placeholders ("-", "SIN TEXTO"), not against short
+    # norms: a decreto whose whole operative text declares a national date runs
+    # to 86 chars and is complete. An actually empty norm has no <Texto> at all,
+    # so length is the wrong test for it and a high floor only discards valid text.
+    full_content: str = Field(..., min_length=30, description="Complete legal text")
 
     @field_validator("full_content")
     @classmethod

@@ -332,6 +332,8 @@ class BCNPlaywrightScraper:
 
                     logger.debug("xml_fetch_success", norm_id=norm_id, xml_length=len(xml_content))
 
+                    xml_content = self._repair_notes_in_binary_tags(norm_id, xml_content)
+
                     if include_notes:
                         xml_content = await self._repair_truncated_articles(
                             norm_id, xml_content, timeout
@@ -350,6 +352,55 @@ class BCNPlaywrightScraper:
         except Exception as e:
             logger.error("xml_fetch_unexpected_error", norm_id=norm_id, error=str(e), error_type=type(e).__name__)
             return None
+
+    def _repair_notes_in_binary_tags(self, norm_id: int, xml_content: str) -> str:
+        """
+        Remove margin-note text that BCN injects inside <aem:ArchivoBinario> tags.
+
+        BCN renders the XML through a fixed-width layout that writes margin notes
+        ("NOTA", "NOTA 1") in a right-hand column. When a norm carries embedded
+        scanned attachments, that column lands in the middle of the attachment's
+        opening tag:
+
+            <aem:ArchivoBinario xmlns:aem="..."            NOTA 1
+            SchemaVersion="1.0"><aem:Nombre>dto232-p19-p21.jpeg</aem:Nombre>
+
+        The stray token makes the whole document not well-formed, so the norm
+        fails to parse even though every article is intact - and since the
+        attachments are base64 images (up to 96% of the payload) the loss is
+        entirely avoidable. Only the note tokens inside those opening tags are
+        removed, so the attachments themselves survive for
+        `extract_binary_content()` to map onto their idParte.
+
+        Args:
+            norm_id: BCN norm ID (for logging)
+            xml_content: Raw XML as fetched
+
+        Returns:
+            XML with the injected note tokens removed from binary tags
+        """
+        repaired_count = 0
+
+        def strip_notes(match) -> str:
+            nonlocal repaired_count
+            tag = match.group(0)
+            if "NOTA" not in tag:
+                return tag
+            repaired_count += 1
+            return re.sub(r"\s*NOTA(\s+\d+)?\s*", " ", tag)
+
+        xml_content = re.sub(
+            r"<aem:ArchivoBinario\b[^>]*>", strip_notes, xml_content
+        )
+
+        if repaired_count:
+            logger.info(
+                "binary_tag_notes_repaired",
+                norm_id=norm_id,
+                tags_repaired=repaired_count,
+            )
+
+        return xml_content
 
     async def scrape_one(self, norm_id: int) -> Optional[ChileanLegalNorm]:
         """

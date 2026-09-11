@@ -1121,8 +1121,19 @@ class BCNXMLParser:
             # BCN uses: <aem:ArchivoBinario nombre="filename.png">base64data</aem:ArchivoBinario>
             for archivo in root.iter():
                 if 'ArchivoBinario' in archivo.tag:
-                    # Found a binary element, now find its parent article
-                    filename = archivo.get('nombre', 'unknown')
+                    # Found a binary element, now find its parent article.
+                    # BCN carries the metadata as child elements, not attributes:
+                    # <aem:Nombre>, <aem:TipoContenido>, <aem:CantidadBytes>.
+                    filename = 'unknown'
+                    content_type = None
+                    byte_count = None
+                    for child in archivo:
+                        if child.tag.endswith('Nombre') and child.text:
+                            filename = child.text.strip()
+                        elif child.tag.endswith('TipoContenido') and child.text:
+                            content_type = child.text.strip()
+                        elif child.tag.endswith('CantidadBytes') and child.text:
+                            byte_count = child.text.strip()
 
                     # Traverse up using parent_map to find element with idParte
                     current = archivo
@@ -1145,12 +1156,21 @@ class BCNXMLParser:
                                 else:
                                     binary_type = 'unknown'
 
-                            binary_map[part_id] = {
+                            # A single article can carry several scanned pages,
+                            # so attachments accumulate instead of overwriting.
+                            entry = binary_map.setdefault(part_id, {
                                 'present': True,
                                 'type': binary_type,
                                 'filename': filename,
-                                'description': 'Contenido binario no indexado (imagen o tabla)'
-                            }
+                                'description': 'Contenido binario no indexado (imagen o tabla)',
+                                'attachments': []
+                            })
+                            entry['attachments'].append({
+                                'filename': filename,
+                                'type': binary_type,
+                                'content_type': content_type,
+                                'bytes': int(byte_count) if byte_count and byte_count.isdigit() else None,
+                            })
 
                             logger.debug(
                                 "binary_content_detected",
