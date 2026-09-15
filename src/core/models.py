@@ -7,7 +7,7 @@ Architecture: Hybrid approach
 - Adapter layer: to_lexintel_format() maps to existing schema
 """
 
-from pydantic import BaseModel, HttpUrl, Field, field_validator
+from pydantic import BaseModel, HttpUrl, Field, field_validator, model_validator
 from datetime import date
 from typing import Optional, List
 from enum import Enum
@@ -103,9 +103,46 @@ class ChileanLegalNorm(BaseModel):
     # norms: a decreto whose whole operative text declares a national date runs
     # to 86 chars and is complete. An actually empty norm has no <Texto> at all,
     # so length is the wrong test for it and a high floor only discards valid text.
+    # PR11: the name is finally accurate. `_extract_full_content()` now walks <Encabezado>,
+    # every <EstructuraFuncional>, every <Anexo> and <Promulgacion>, in that order. PR10
+    # added the promulgation, PR11 the annexes; before them both were absent while present in
+    # hierarchy, article_texts and the chunks. There is still no max_length, deliberately:
+    # after PR11 the largest measured document (norm 198321, 11 annexes) reaches 1.35M chars,
+    # and a cap would silently truncate a treaty. Pinned by
+    # tests/test_chunking_text_decoupling.py.
     full_content: str = Field(..., min_length=30, description="Complete legal text")
 
-    @field_validator("full_content")
+    # PR9: pipeline input, kept separate from the stored `full_content`.
+    #
+    # This is the text the chunker uses for routing (`_detect_articles()`) and as the
+    # source of the fallback-route chunks. Since PR10 it is NO LONGER the same string as
+    # `full_content`, and since PR11 the two can differ by megabytes. That is the point of
+    # having two fields: `full_content` gained <Promulgacion> and then <Anexo> without either
+    # reaching the chunker, where annex text (full of "Articulo N" lines) would flip
+    # `_detect_articles()` and alter the fallback chunks.
+    #
+    # Not stored: excluded from serialization, and neither the S3 document built in
+    # run_scraper.process_norm_data() nor to_lexintel_format() mentions it.
+    chunking_text: str = Field(
+        default="",
+        exclude=True,
+        description="Text used only for chunker routing and fallback chunking",
+    )
+
+    @model_validator(mode="after")
+    def default_chunking_text_to_full_content(self):
+        """
+        Back-compat for constructors that do not set `chunking_text`.
+
+        The XML parser sets it explicitly. The legacy HTML parser
+        (core/parser.py, unreachable from production) builds the model from a plain
+        dict and does not, and an empty string would make `chunk()` raise.
+        """
+        if not self.chunking_text:
+            self.chunking_text = self.full_content
+        return self
+
+    @field_validator("full_content", "chunking_text")
     @classmethod
     def validate_content_clean(cls, v: str) -> str:
         """Ensure content doesn't contain unparsed HTML."""

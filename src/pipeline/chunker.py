@@ -86,12 +86,25 @@ class ProfessionalChunker:
         """
         return int(len(text) * 0.6)
 
-    def chunk(self, text: str, metadata: Optional[Dict] = None, html: Optional[str] = None, norm_id: Optional[int] = None, xml_content: Optional[str] = None) -> List[Chunk]:
+    def chunk(self, routing_text: str, metadata: Optional[Dict] = None, html: Optional[str] = None, norm_id: Optional[int] = None, xml_content: Optional[str] = None) -> List[Chunk]:
         """
-        Chunk text using semantic boundaries.
+        Chunk a norm.
 
         Args:
-            text: Full text to chunk
+            routing_text: Plain text used ONLY for routing and for the fallback
+                branches. It decides `_detect_articles()`, which selects the branch,
+                and it is the text the fallback branches actually chunk. On the XML
+                route it is not the chunk source: those chunks come from the parsed
+                structure (`article_texts` / `hierarchy`), so perturbing this argument
+                leaves them byte-identical -- see tests/test_chunking_text_decoupling.py.
+
+                This is deliberately NOT documented as "the full text of the norm".
+                Production passes `norm.chunking_text`, not `norm.full_content`
+                (PR9): the two hold the same string today, but they are separate so
+                that later making `full_content` complete (adding <Anexo> and
+                <Promulgacion>) cannot silently change routing. Annex text carries
+                "Articulo N" lines that flip `_detect_articles()` False -> True, which
+                on the fallback route changes the branch and the chunks.
             metadata: Optional metadata to attach to all chunks
             html: Optional raw HTML for hierarchy extraction (legacy)
             norm_id: Optional norm ID for hierarchy extraction
@@ -100,10 +113,10 @@ class ProfessionalChunker:
         Returns:
             List of Chunk objects
         """
-        if not text or not text.strip():
+        if not routing_text or not routing_text.strip():
             raise ValueError("Text cannot be empty")
 
-        text = self._normalize_text(text)
+        text = self._normalize_text(routing_text)
 
         hierarchy = {}
         article_texts = {}
@@ -131,35 +144,38 @@ class ProfessionalChunker:
 
         has_articles = self._detect_articles(text)
 
-        if has_articles and hierarchy:
-            if article_texts:
-                logger.info("chunking_by_xml_idparte", total_parts=len(hierarchy))
+        # PR4: the XML route is chosen from the real XML structure, not from counting
+        # "Articulo N" in the text. _detect_articles() needs 3 textual matches, so a norm
+        # with one or two articles used to fall through to the semantic fallback even
+        # though its structure was fully available. Measured on the audit corpus: 378 of
+        # 1,184 documents were routed by text instead of by structure.
+        has_real_structure = self._has_real_structure(hierarchy)
 
-                structural_context = {}
-                if xml_content and norm_id:
-                    try:
-                        from core.xml_parser import BCNXMLParser
-                        parser = BCNXMLParser()
-                        structural_context = parser.extract_structural_context(xml_content, norm_id)
-                        logger.info("structural_context_loaded", articles_with_context=len(structural_context))
-                    except Exception as e:
-                        logger.warning("structural_context_extraction_failed", error=str(e))
+        if hierarchy and article_texts and has_real_structure:
+            logger.info("chunking_by_xml_idparte", total_parts=len(hierarchy))
 
-                article_chunks = self._chunk_by_xml(article_texts, hierarchy, metadata, structural_context, binary_map)
+            structural_context = {}
+            if xml_content and norm_id:
+                try:
+                    from core.xml_parser import BCNXMLParser
+                    parser = BCNXMLParser()
+                    structural_context = parser.extract_structural_context(xml_content, norm_id)
+                    logger.info("structural_context_loaded", articles_with_context=len(structural_context))
+                except Exception as e:
+                    logger.warning("structural_context_extraction_failed", error=str(e))
 
-                # NO special chunks - ruta viaja CON el articulo
-                chunks = article_chunks
+            article_chunks = self._chunk_by_xml(article_texts, hierarchy, metadata, structural_context, binary_map)
 
-                logger.info(
-                    "chunking_complete",
-                    total_chunks=len(chunks)
-                )
-            elif html:
-                logger.info("chunking_by_html_idparte", total_parts=len(hierarchy))
-                chunks = self._chunk_by_idparte(html, hierarchy, metadata)
-            else:
-                logger.info("chunking_legal_text_with_articles")
-                chunks = self._chunk_by_articles(text)
+            # NO special chunks - ruta viaja CON el articulo
+            chunks = article_chunks
+
+            logger.info(
+                "chunking_complete",
+                total_chunks=len(chunks)
+            )
+        elif has_articles and hierarchy and html:
+            logger.info("chunking_by_html_idparte", total_parts=len(hierarchy))
+            chunks = self._chunk_by_idparte(html, hierarchy, metadata)
         elif has_articles:
             logger.info("chunking_legal_text_with_articles")
             chunks = self._chunk_by_articles(text)
@@ -386,6 +402,30 @@ class ProfessionalChunker:
             matches += len(re.findall(pattern, text, re.IGNORECASE))
 
         return matches >= 3
+
+    def _has_real_structure(self, hierarchy: dict) -> bool:
+        """
+        Whether the hierarchy holds content of its own, beyond the PR3 synthetic parts.
+
+        Since PR3, <Encabezado> and <Promulgacion> enter the hierarchy as synthetic
+        parts, so a non-empty hierarchy no longer proves the norm has articles: a
+        document whose only content is an 81-character header would satisfy
+        `bool(hierarchy)` and would lose its `routing_text` to the XML route. Norm 15989 is
+        a real instance of that in the audit corpus.
+
+        Entries without a content_type (the legacy HTML hierarchy, and anything built
+        before PR3) count as real, matching the "article" default used when chunk
+        metadata is assembled.
+        """
+        from core.xml_parser import BCNXMLParser
+
+        synthetic = {
+            BCNXMLParser.CONTENT_TYPE_HEADER,
+            BCNXMLParser.CONTENT_TYPE_PROMULGATION,
+        }
+        return any(
+            info.get("content_type") not in synthetic for info in hierarchy.values()
+        )
 
     def _extract_article_number(self, text: str) -> Optional[int]:
         """
@@ -704,11 +744,25 @@ class ProfessionalChunker:
         Detects "Articulo N" boundaries and creates synthetic part_ids/hierarchy
         entries per treaty article, so the normal per-article chunking logic
         (including subdivision detection) runs independently on each block.
-        """
-        new_article_texts = dict(article_texts)
-        new_hierarchy = dict(hierarchy)
 
+        PR12: the sub-parts take the POSITION of the annex they came from. Until PR12 this
+        deleted `anexo_X` and assigned the sub-keys, and a new dict key always lands at the
+        end -- so the sub-parts jumped behind `promulgation_{id}`, which PR3 inserts last.
+        Since _chunk_by_xml() iterates article_texts in insertion order, the promulgation
+        chunk ended up in the middle of the treaty (index 2 of 12 on norm 252869), and after
+        PR11 the stored `full_content` and the stored `chunks[]` of the same document
+        disagreed about the order in 62 of 85 measured annex documents.
+
+        So the split now runs in two passes: collect the sub-parts, then rebuild the dicts
+        in the original key order, expanding each split annex where it already was. Nothing
+        else changes -- not the boundaries, not the block text, not the keys, not the PR7
+        de-duplication, not the order of the sub-parts among themselves (which follows the
+        text, not the article numbers). The change is purely positional.
+        """
         article_boundary = re.compile(r'(?=\bArt[ií]culo\s+\d+\b)', re.IGNORECASE)
+
+        # part_id -> [(sub_key, block, sub_info)], in the order the splitter produces them.
+        splits: Dict[str, List[Tuple[str, str, dict]]] = {}
 
         for part_id, part_info in hierarchy.items():
             if not part_info.get("is_annex"):
@@ -722,19 +776,72 @@ class ProfessionalChunker:
             if len(blocks) <= 1:
                 continue  # No detectable per-article structure, keep as single annex block
 
-            del new_article_texts[part_id]
-            del new_hierarchy[part_id]
+            # PR7. The sub_key must be unique or blocks silently overwrite each other in
+            # new_article_texts and the earlier block is lost with no warning. Two
+            # mechanisms did exactly that, both measured (see
+            # tests/test_annex_extraction.py):
+            #
+            #   1. A block with no "Articulo N" fell back to str(i + 1). For the text
+            #      before the first article -- the annex preamble, its title, or a tariff
+            #      table -- that is "1", which collides with the real Articulo 1 and gets
+            #      overwritten by it. This is the common shape: an annex usually opens with
+            #      a preamble.
+            #   2. An annex holding more than one treaty restarts numbering, so a second
+            #      "Articulo 1" collides with the first.
+            #
+            # Only the key construction changes. Block boundaries, block text and the
+            # labels of blocks that do carry a number are untouched.
+            used_keys = set()
+            sub_parts = []
 
             for i, block in enumerate(blocks):
                 match = re.match(r'Art[ií]culo\s+(\d+)', block, re.IGNORECASE)
-                treaty_article_num = match.group(1) if match else str(i + 1)
 
-                sub_key = f"{part_id}_art{treaty_article_num}"
-                new_article_texts[sub_key] = block
+                if match:
+                    treaty_article_num = match.group(1)
+                    sub_key = f"{part_id}_art{treaty_article_num}"
+                    article_label = f"Anexo, Artículo {treaty_article_num}"
+                else:
+                    # Not an article, so it must not be numbered as one.
+                    sub_key = f"{part_id}_intro" if i == 0 else f"{part_id}_block{i}"
+                    article_label = part_info.get("article_label") or "Anexo"
+
+                # A repeat keeps its own entry instead of replacing the earlier one.
+                if sub_key in used_keys:
+                    suffix = 2
+                    while f"{sub_key}_{suffix}" in used_keys:
+                        suffix += 1
+                    sub_key = f"{sub_key}_{suffix}"
+                used_keys.add(sub_key)
 
                 sub_info = part_info.copy()
-                sub_info["article_label"] = f"Anexo, Artículo {treaty_article_num}"
-                new_hierarchy[sub_key] = sub_info
+                sub_info["article_label"] = article_label
+                sub_parts.append((sub_key, block, sub_info))
+
+            splits[part_id] = sub_parts
+
+        if not splits:
+            return dict(article_texts), dict(hierarchy)
+
+        # Rebuild both dicts in their original key order, expanding a split annex in place.
+        # The two are rebuilt independently on purpose: a part_id can exist in one and not
+        # in the other (a known pre-existing asymmetry), and rebuilding one from the other's
+        # order would silently drop those entries.
+        new_article_texts: Dict[str, str] = {}
+        for key, text in article_texts.items():
+            if key in splits:
+                for sub_key, block, _ in splits[key]:
+                    new_article_texts[sub_key] = block
+            else:
+                new_article_texts[key] = text
+
+        new_hierarchy = {}
+        for key, info in hierarchy.items():
+            if key in splits:
+                for sub_key, _, sub_info in splits[key]:
+                    new_hierarchy[sub_key] = sub_info
+            else:
+                new_hierarchy[key] = info
 
         return new_article_texts, new_hierarchy
 
@@ -875,6 +982,21 @@ class ProfessionalChunker:
                 "in_force": in_force,
                 "force_status": force_status,
                 "is_transitory": is_transitory,
+                # What kind of content this chunk holds: article, transitory, annex,
+                # header or promulgation. Defaults to "article" so any part built before
+                # PR3 keeps its previous meaning.
+                "content_type": part_info.get("content_type", "article"),
+                # PR5 observability: the part's text still ends mid-sentence in the XML
+                # this chunk came from, which in production is already post-repair. It is
+                # not is_repaired -- a successfully repaired part is indistinguishable
+                # from one that was never truncated. Read from the hierarchy so there is
+                # a single source of truth (BCNXMLParser.is_part_truncated); defaults to
+                # False for any hierarchy built before PR5.
+                "is_truncated": part_info.get("is_truncated", False),
+                # PR6 observability: what _strip_margin_notes() removed from this part's
+                # text. Copied from the hierarchy, never recomputed, so there is one
+                # measurement per part. None for a hierarchy built before PR6.
+                "margin_notes": part_info.get("margin_notes"),
                 "version_date": version_date,
                 "official_url": article_url,  # Override with article-specific URL
                 # Structural context (CRITICAL for filters and citations)
@@ -1608,7 +1730,25 @@ class ProfessionalChunker:
         Add overlap between chunks for context preservation.
 
         Takes last N tokens from previous chunk and prepends to next chunk.
+
+        Only plain-text chunks can be overlapped. A structured chunk is a dict, and
+        `f"{overlap} [...] {chunk}"` would serialize it into its own repr: the chunk
+        stops being a dict, so the assembly loop in chunk() falls back to the norm-level
+        metadata and silently drops part_id, formatted_citation, in_force and
+        content_type. _get_last_n_tokens() does not raise on a dict either -- len({...})
+        is 2, which is below the character cutoff, so the dict is returned as-is and
+        interpolated. The failure is silent in both directions.
+
+        PR4 needs this because the flipped route sends structured chunks down a path
+        where has_articles is False. It also covers a pre-existing instance of the same
+        bug: the non-articulated branch already built dict chunks and already reached
+        this method. Fixing both at once is unavoidable -- they are the same line -- and
+        is intentional, not an accidental widening of scope.
         """
+        if any(isinstance(chunk, dict) for chunk in chunks):
+            logger.debug("overlap_skipped_structured_chunks", total_chunks=len(chunks))
+            return chunks
+
         if len(chunks) <= 1 or self.overlap_tokens == 0:
             return chunks
 

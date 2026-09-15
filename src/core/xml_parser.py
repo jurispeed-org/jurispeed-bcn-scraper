@@ -5,6 +5,7 @@ Parses the official XML schema from BCN's obtxml service.
 Schema: EsquemaIntercambioNorma-v1-0.xsd
 """
 
+import html
 import xml.etree.ElementTree as ET
 import re
 from typing import Dict, List, Optional, Tuple
@@ -92,29 +93,164 @@ class BCNXMLParser:
             return False
         return bool(self._NOTE_ONLY_LINE_PATTERN.match(line))
 
-    def _strip_margin_notes(self, text: str) -> str:
+    # --- Truncation predicate -----------------------------------------------------
+    # Moved here in PR5 from BCNPlaywrightScraper so parser and scraper share ONE
+    # implementation instead of two that can drift. The scraper delegates to these;
+    # its repair algorithm is unchanged. The rules themselves are untouched.
+
+    # Editorial notes are appended after the body, behind a bare "NOTA" line
+    _NOTE_BLOCK_PATTERN = re.compile(r'\n[ \t]*\n[ \t]*NOTAS?[ \t]*\n')
+    # A complete Chilean legal article always closes on sentence-terminating
+    # punctuation. "º" is excluded on purpose: Art. 19 truncates on a dangling
+    # "20º", which would otherwise look like a legitimate ending.
+    _SENTENCE_TERMINATORS = '.;:!?)"”'
+    # Repealed articles are legitimately a bare marker with no closing period
+    _REPEAL_MARKER_PATTERN = re.compile(
+        r'^\s*(?:Art\S*\s*[\wº°.\-]*\s*[.\-]*\s*)?'
+        r'(?:Derogado|Suprimido|Eliminado|Sin efecto)\s*\.?\s*$',
+        re.IGNORECASE,
+    )
+
+    def _split_note_block(self, text: str) -> Tuple[str, str]:
+        """Splits an article's <Texto> into (body, editorial_note_block)."""
+        match = self._NOTE_BLOCK_PATTERN.search(text)
+        if not match:
+            return text, ""
+        return text[:match.start()], text[match.start():]
+
+    def is_part_truncated(self, raw_text: str) -> bool:
         """
-        Removes BCN's right-hand amendment-history column from an article body.
+        True if a part's text was cut off mid-sentence.
+
+        BCN renders the XML through a fixed-width layout engine that overflows on
+        articles carrying dense amendment history, silently cutting <Texto> mid-word
+        (e.g. Art. 107 of the Constitution ends at "disposicio").
+
+        Margin notes are stripped first, otherwise the trailing amendment reference in
+        the right-hand column would look like the end of the text. An empty body is not
+        truncated (there is nothing to cut), and neither is a bare repeal marker, which
+        legitimately has no closing period.
+
+        This answers exactly one question -- "does this text end on terminating
+        punctuation?" -- about the text it is handed. It has no knowledge of whether a
+        repair was attempted, so it cannot report `is_repaired`. See extract_article_
+        hierarchy() for what that means for the flag stored per part.
+        """
+        body, _ = self._split_note_block(html.unescape(raw_text))
+        body = self._strip_margin_notes(body).strip()
+        if not body or self._REPEAL_MARKER_PATTERN.match(body):
+            return False
+        return body[-1] not in self._SENTENCE_TERMINATORS
+
+    # --- Margin-note instrumentation ----------------------------------------------
+    # PR6. The heuristic below is UNCHANGED; what changed is that it now reports what
+    # it removed. There is exactly one implementation of the "this is a margin note"
+    # decision (strip_margin_notes_with_stats), and _strip_margin_notes() is a thin
+    # wrapper over it, so no second copy of the rules can drift away from the first.
+
+    # The four ways this heuristic removes content, named after the rule that fired.
+    # Each name maps 1:1 to a branch of the loop; they are not a reclassification.
+    REASON_DEEP_INDENT = 'deep_indent_line'      # _DEEP_INDENT_NOTE_PATTERN
+    REASON_NOTE_ONLY = 'note_only_line'          # _is_note_only_line
+    REASON_CONTINUATION = 'continuation_line'    # _NOTE_CONTINUATION_LINE_PATTERN
+    REASON_SAME_LINE = 'same_line_tail'          # _MARGIN_NOTE_PATTERN
+
+    _MARGIN_NOTE_REASONS = (
+        REASON_DEEP_INDENT, REASON_NOTE_ONLY, REASON_CONTINUATION, REASON_SAME_LINE,
+    )
+
+    # Cap on captured fragments. Only used by audits and tests that need to show WHICH
+    # text was removed; production never asks for them, so no removed content is stored
+    # in a document and memory does not grow with document size.
+    _MAX_CAPTURED_FRAGMENTS = 20
+    _CAPTURED_FRAGMENT_CHARS = 120
+
+    def empty_margin_note_stats(self) -> Dict:
+        """Zeroed stats, for parts whose text never reached the heuristic."""
+        return {
+            'notes_detected': 0,
+            'lines_affected': 0,
+            'chars_removed': 0,
+            'words_removed': 0,
+            'by_reason': {reason: 0 for reason in self._MARGIN_NOTE_REASONS},
+        }
+
+    def strip_margin_notes_with_stats(
+        self, text: str, capture_fragments: bool = False
+    ) -> Tuple[str, Dict]:
+        """
+        Removes BCN's right-hand amendment-history column, and reports what it removed.
 
         Handles both notes sharing a line with the body and notes occupying whole
         lines of their own (including their wrapped continuations).
+
+        This is the single implementation of the heuristic. The control flow, the order
+        of the branches and every pattern are exactly what _strip_margin_notes() ran
+        before PR6; the only additions are counters, so the returned text is identical
+        for any input.
+
+        Stats:
+            notes_detected  contiguous note BLOCKS, not lines: a note that wraps over
+                            four lines is one note. Counted on the transition into a
+                            note, which is a real boundary in the algorithm and not an
+                            invented grouping. There is no separate `notes_removed`:
+                            this heuristic has no detect-without-removing path, so the
+                            two numbers would be the same by construction and shipping
+                            both would just be two names for one fact. Note the cost of
+                            counting blocks: two distinct notes on adjacent lines count as
+                            one, because a same-line note leaves the block open for the
+                            wrapped tail that usually follows. When the question is "how
+                            much was removed", read words_removed, not this.
+            lines_affected  physical lines that lost content, whole or partial.
+            chars_removed   characters dropped. Includes the column gap and the
+                            indentation of dropped lines, because BCN pads with
+                            whitespace and the gap belongs to the note's layout, not to
+                            the body. Consequently this number OVERSTATES lost text.
+            words_removed   whitespace-delimited tokens dropped. This is the meaningful
+                            "how much text was lost" figure and the one the historical
+                            audit used, precisely because chars are inflated by padding.
+            by_reason       counts per firing rule, keyed by the REASON_* constants.
+            fragments       present only when capture_fragments is True: up to
+                            _MAX_CAPTURED_FRAGMENTS truncated samples of removed text,
+                            for evidence in audits and tests.
         """
+        stats = self.empty_margin_note_stats()
+        fragments: List[Dict] = [] if capture_fragments else []
+
+        def record(reason: str, removed: str, line_number: int) -> None:
+            stats['notes_detected'] += int(not in_note)
+            stats['lines_affected'] += 1
+            stats['chars_removed'] += len(removed)
+            stats['words_removed'] += len(removed.split())
+            stats['by_reason'][reason] += 1
+            if capture_fragments and len(fragments) < self._MAX_CAPTURED_FRAGMENTS:
+                fragments.append({
+                    'reason': reason,
+                    'line': line_number,
+                    'text': removed.strip()[:self._CAPTURED_FRAGMENT_CHARS],
+                })
+
         kept = []
         in_note = False
 
-        for line in text.split('\n'):
+        for line_number, line in enumerate(text.split('\n')):
             if self._DEEP_INDENT_NOTE_PATTERN.match(line):
+                record(self.REASON_DEEP_INDENT, line, line_number)
                 in_note = True
                 continue
 
             if self._is_note_only_line(line):
+                record(self.REASON_NOTE_ONLY, line, line_number)
                 in_note = True
                 continue
 
             if in_note and line.strip() and self._NOTE_CONTINUATION_LINE_PATTERN.match(line):
+                record(self.REASON_CONTINUATION, line, line_number)
                 continue
 
             stripped = self._MARGIN_NOTE_PATTERN.sub('', line)
+            if stripped != line:
+                record(self.REASON_SAME_LINE, line[len(stripped):], line_number)
             # A same-line note also opens a note block: its wrapped tail lands on
             # the following lines.
             in_note = stripped != line
@@ -122,7 +258,19 @@ class BCNXMLParser:
             # body behind as trailing spaces.
             kept.append(stripped.rstrip())
 
-        return '\n'.join(kept)
+        if capture_fragments:
+            stats['fragments'] = fragments
+
+        return '\n'.join(kept), stats
+
+    def _strip_margin_notes(self, text: str) -> str:
+        """
+        Removes BCN's right-hand amendment-history column from an article body.
+
+        Kept as the name every call site already uses. The rules live in
+        strip_margin_notes_with_stats(); this only discards the stats.
+        """
+        return self.strip_margin_notes_with_stats(text)[0]
 
     def _find_article_structures(self, root: ET.Element) -> List[ET.Element]:
         """Find all EstructuraFuncional elements that represent articles (regular or transitory)."""
@@ -173,7 +321,13 @@ class BCNXMLParser:
 
             full_content = self._extract_full_content(root)
 
-            norm = ChileanLegalNorm(**metadata, full_content=full_content)
+            # Two names for the same string today, deliberately extracted separately so
+            # that changing what `full_content` holds cannot change chunker routing (PR9).
+            norm = ChileanLegalNorm(
+                **metadata,
+                full_content=full_content,
+                chunking_text=self._extract_chunking_text(root),
+            )
 
             logger.info(
                 "xml_parsed_successfully",
@@ -298,22 +452,66 @@ class BCNXMLParser:
             return name_elem.text.strip()
         return None
 
+    # Values BCN uses in the norm-level `derogado` attribute. The corpus only ever
+    # contains "derogado" / "no derogado" (measured over 1,184 XMLs); "1" is accepted
+    # defensively because an earlier implementation expected it.
+    REPEALED_ATTR_VALUES = {'derogado', '1'}
+    IN_FORCE_ATTR_VALUES = {'no derogado', '0'}
+
     def extract_norm_vigencia(self, xml_content: str) -> bool:
         """
-        Extract global in_force status from XML root derogado attribute.
+        Extract norm-level in_force status from the <Norma> `derogado` attribute.
 
-        Extract vigencia from XML root to propagate to non-articulated chunks.
+        <Norma> is the ROOT element, not a descendant, so it must be read off the root
+        directly. The `.//ns:Norma` lookup used previously could never match, which made
+        this method return True unconditionally.
+
+        Note this is deliberately the NORM-level status only. A `FechaDerogacion` inside
+        an EstructuraFuncional/Metadatos block marks the repeal of that individual part
+        and does not repeal the norm: 58 documents in the audit corpus carry a past
+        part-level FechaDerogacion while being correctly `no derogado` as a whole.
+        Per-part vigencia is already handled in extract_article_hierarchy().
 
         Returns:
-            True if norm is in force (derogado != "1"), False otherwise
+            True if the norm is in force, False if repealed.
+            Defaults to True when the attribute is absent or unrecognized.
+
+        Fallback policy (deliberate): every uncertain case returns True. A wrong False
+        would hide a norm that is actually in force from every search, silently and with
+        no way for a user to tell the content is missing. A wrong True leaves the norm
+        visible and auditable, and shows up as a warning in the logs. The asymmetry is
+        intentional; do not "tighten" it into failing closed.
         """
         try:
             root = ET.fromstring(xml_content)
-            norma = root.find('.//ns:Norma', self.NS)
-            if norma is not None:
-                derogado = norma.get('derogado', '0')
-                return derogado != '1'
+
+            # <Norma> is the ROOT element. Read the attribute straight off it: there is
+            # no descendant lookup on purpose, since that was the original bug.
+            local_name = root.tag.split('}')[-1]
+            if local_name != 'Norma':
+                logger.warning("vigencia_unexpected_root_element", root_tag=root.tag)
+                return True
+
+            raw = root.get('derogado')
+            if raw is None:
+                logger.debug("vigencia_attribute_absent", norma_id=root.get('normaId'))
+                return True
+
+            value = raw.strip().lower()
+
+            if value in self.REPEALED_ATTR_VALUES:
+                return False
+            if value in self.IN_FORCE_ATTR_VALUES:
+                return True
+
+            logger.warning(
+                "vigencia_attribute_unrecognized",
+                value=raw,
+                norma_id=root.get('normaId'),
+                note="Defaulting to in_force",
+            )
             return True
+
         except Exception as e:
             logger.warning("vigencia_extraction_error", error=str(e))
             return True  # Default to in_force if extraction fails
@@ -511,10 +709,104 @@ class BCNXMLParser:
 
     def _extract_full_content(self, root: ET.Element) -> str:
         """
-        Extract full text content from XML.
+        Extract the text stored as `full_content`.
 
-        Concatenates all text from all parts.
-        Skips binary attachments (images).
+        Contract as of PR11, and now complete:
+
+            <Encabezado> + every <EstructuraFuncional> + every <Anexo> + <Promulgacion>
+
+        joined by blank lines, in that order. That is the reading order PR3 documented and
+        the order both extract_article_texts() and extract_article_hierarchy() build their
+        dicts in, so this field and those two structures agree.
+
+        The order matters and is not "append the new thing at the end". PR10 appended the
+        promulgation last, which was correct only because no annex was present; PR11 inserts
+        the annexes BEFORE it, because the promulgation closes the document.
+
+        Known discrepancy, deliberately NOT resolved here: for an annex that the chunker
+        SPLITS, `_split_annexes_by_treaty_article()` deletes the parent key and appends the
+        sub-keys, so the resulting chunk sequence puts those blocks after the promulgation
+        chunk. That is the pre-existing ordering defect recorded in docs/KNOWN_BUGS.md; it
+        lives in the chunker, and this method follows the parser's order rather than
+        mirroring it.
+
+        History, because the omissions were long-lived: before PR10 this method returned
+        exactly _extract_chunking_text(), so the promulgation was absent from 1,176 of the
+        1,184 audited documents; before PR11 the annexes were absent from 314 of them, where
+        the annex is an estimated median 85% of the field.
+
+        This method and _extract_chunking_text() stay separate because they answer different
+        questions: this one is "what do we store", the other is "what does the chunker route
+        on" (PR9). This one may grow; the other must not, or routing changes with it. That
+        separation is what makes PR11 a storage change: annex text carries "Articulo N"
+        lines, and reaching the routing input it would flip `_detect_articles()`.
+        """
+        # Neither the annexes nor the promulgation are located with a second find() here.
+        # Both come from the helpers that already produce the stored parts, so the text
+        # appended is byte-identical to the corresponding article_texts entries: same node
+        # resolution, same binary removal, same margin-note stripping, same skipping of
+        # empty and id-less nodes, same document order.
+        annexes = [part['text'] for part in self._extract_annex_parts(root)]
+        promulgation = [
+            part['text'] for part in self._extract_synthetic_parts(root)
+            if part['content_type'] == self.CONTENT_TYPE_PROMULGATION
+        ]
+        # The header is excluded from the synthetic list on purpose: _extract_chunking_text()
+        # already emitted it, and appending it again would duplicate content.
+        # Empty sections are filtered so a document with no header and no structures does
+        # not gain a leading blank line, matching how _extract_chunking_text() joins.
+        return '\n\n'.join(
+            section
+            for section in [self._extract_chunking_text(root)] + annexes + promulgation
+            if section
+        )
+
+    def _extract_annex_parts(self, root: ET.Element) -> List[Dict[str, str]]:
+        """
+        The <Anexo> bodies that become parts, in document order.
+
+        Extracted in PR11 from the loop extract_article_texts() already ran, and called from
+        both, so `full_content` cannot drift from `article_texts`. The rules are that loop's
+        rules, unchanged: an annex with no `idParte` is skipped (it could not be keyed), an
+        annex with no <Texto> or no text left after stripping is skipped, and the key is
+        `anexo_{idParte}`.
+
+        Skipping id-less annexes means their text reaches neither the chunks nor
+        `full_content`. That is pre-existing behavior, not a PR11 decision; no annex in the
+        9 real annex documents on disk lacks an `idParte`, and the corpus-wide count is
+        unmeasured.
+        """
+        parts = []
+        for annex in root.findall('.//ns:Anexo', self.NS):
+            id_parte = annex.get('idParte')
+            if not id_parte:
+                continue
+
+            text_elem = annex.find('ns:Texto', self.NS)
+            if text_elem is None:
+                continue
+
+            text = self._strip_margin_notes(self._extract_text_without_binaries(text_elem))
+            if text:
+                parts.append({'key': f"anexo_{id_parte}", 'text': text})
+
+        return parts
+
+    def _extract_chunking_text(self, root: ET.Element) -> str:
+        """
+        Extract the plain text handed to the chunker for routing and fallback chunking.
+
+        Contract, as implemented (not as the name of `full_content` suggests):
+
+        - INCLUDES <Encabezado>/<Texto> and the <Texto> of every <EstructuraFuncional>,
+          nested ones included (the search is `.//`), joined by blank lines.
+        - EXCLUDES <Anexo> and <Promulgacion> entirely.
+        - Margin notes stripped, binary attachments (images) removed.
+
+        The exclusions are a known defect for `full_content` (docs/KNOWN_BUGS.md) but are
+        load-bearing here: annex text is full of "Articulo N" lines, and adding it would
+        flip `_detect_articles()` and change which fallback branch runs. Pinned by
+        tests/test_chunking_text_decoupling.py.
         """
         content_parts = []
 
@@ -532,6 +824,117 @@ class BCNXMLParser:
                     content_parts.append(text)
 
         return '\n\n'.join(content_parts)
+
+    # Conceptual kind of content a part carries. Added in PR3 so non-article content
+    # (header, promulgation) can travel through the same intermediate model as articles
+    # instead of being dropped. Existing part_ids are untouched; only synthetic parts get
+    # synthetic ids.
+    CONTENT_TYPE_ARTICLE = 'article'
+    CONTENT_TYPE_HEADER = 'header'
+    CONTENT_TYPE_PROMULGATION = 'promulgation'
+    CONTENT_TYPE_ANNEX = 'annex'
+    CONTENT_TYPE_TRANSITORY = 'transitory'
+
+    def _synthetic_id_base(self, root: ET.Element, norm_id: Optional[int] = None) -> str:
+        """
+        Id used to build synthetic part keys (header_{id}, promulgation_{id}).
+
+        Read from the XML itself so extract_article_hierarchy() and
+        extract_article_texts() always agree, even though only the former is given a
+        norm_id. A mismatch between them would make the chunker drop the part.
+        """
+        return root.get('normaId') or (str(norm_id) if norm_id is not None else 'unknown')
+
+    def _extract_synthetic_parts(
+        self, root: ET.Element, norm_id: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        Extract <Encabezado> and <Promulgacion> as synthetic parts.
+
+        These carry real normative content -- the header holds the title, number, issuing
+        body and preamble; the promulgation holds the signatures and the "tomese razon"
+        formula -- but neither has an idParte, so neither ever entered
+        hierarchy/article_texts. Measured coverage before PR3: header 23.8%,
+        promulgation 0.0%.
+
+        Extracted straight from the XML structure. _extract_special_chunks() is NOT used:
+        it reconstructed the preamble by diffing text against article bodies, which is
+        both lossy and unable to see the promulgation at all.
+
+        Returns parts in reading order (header first, promulgation last), each as a dict
+        the two public extractors can consume without duplicating logic.
+        """
+        id_base = self._synthetic_id_base(root, norm_id)
+
+        specs = (
+            ('Encabezado', f'header_{id_base}', 'Encabezado', self.CONTENT_TYPE_HEADER),
+            ('Promulgacion', f'promulgation_{id_base}', 'Promulgación',
+             self.CONTENT_TYPE_PROMULGATION),
+        )
+
+        parts = []
+        for tag, key, label, content_type in specs:
+            element = root.find(f'ns:{tag}', self.NS)
+            if element is None:
+                continue
+
+            text_elem = element.find('ns:Texto', self.NS)
+            if text_elem is None:
+                continue
+
+            # Same cleaning as articles. PR3 does not change margin-note behavior.
+            # PR6 asks the same call what it removed, so the header's and promulgation's
+            # stats come from the very invocation that produced their text -- not from a
+            # second pass that could see something different.
+            text, margin_note_stats = self.strip_margin_notes_with_stats(
+                self._extract_text_without_binaries(text_elem)
+            )
+            if not text:
+                continue
+
+            repealed_attr = element.get('derogado', 'no derogado')
+
+            parts.append({
+                'key': key,
+                'label': label,
+                'content_type': content_type,
+                'text': text,
+                'in_force': repealed_attr == 'no derogado',
+                'version_date': element.get('fechaVersion'),
+                'margin_notes': margin_note_stats,
+            })
+
+        return parts
+
+    def _synthetic_hierarchy_entry(self, part: Dict) -> Dict:
+        """
+        Hierarchy entry for a synthetic part.
+
+        Deliberately carries the same keys as an article entry so every existing consumer
+        (chunker, metadata builders) keeps working without special-casing. article_number
+        is None, exactly as annexes already do.
+        """
+        return {
+            'article_number': None,
+            'article_label': part['label'],
+            'is_nested': False,
+            'parent_article': None,
+            'hierarchy_level': 0,
+            'in_force': part['in_force'],
+            'version_date': part['version_date'],
+            'is_transitory': False,
+            'content_type': part['content_type'],
+            # PR5: a synthetic part cannot be truncated under the defined semantics (BCN's
+            # layout overflow hits articles with amendment history, and the repair path
+            # never considers <Encabezado>/<Promulgacion>). Stated explicitly as False
+            # rather than left absent, because every consumer -- and the key-set equality
+            # test in tests/test_synthetic_parts.py -- expects article-shaped entries.
+            'is_truncated': False,
+            # PR6: measured, not stated. A header or promulgation goes through exactly the
+            # same margin-note stripping as an article (_extract_synthetic_parts), so it
+            # can lose content the same way and the number must be real.
+            'margin_notes': part['margin_notes'],
+        }
 
     def extract_article_hierarchy(self, xml_content: str, norm_id: int) -> Dict[str, Dict]:
         """
@@ -554,6 +957,12 @@ class BCNXMLParser:
             hierarchy = {}
 
             parent_map = {c: p for p in root.iter() for c in p}
+
+            # Header goes first so the intermediate model keeps reading order.
+            for part in self._extract_synthetic_parts(root, norm_id):
+                if part['content_type'] != self.CONTENT_TYPE_HEADER:
+                    continue
+                hierarchy[part['key']] = self._synthetic_hierarchy_entry(part)
 
             for structure in self._find_article_structures(root):
                 id_parte = structure.get('idParte')
@@ -638,6 +1047,28 @@ class BCNXMLParser:
                 transitorio_attr = structure.get('transitorio', 'no transitorio')
                 is_transitory = transitorio_attr == 'transitorio'
 
+                # PR5 observability. Describes the XML this parser was handed, which in
+                # production is already post-repair: True therefore means "still cut off
+                # after whatever repair ran", not "BCN served it cut off". A part that was
+                # truncated and successfully repaired is indistinguishable here from one
+                # that was never truncated -- both end on a period -- so this flag is
+                # deliberately NOT is_repaired. See is_part_truncated().
+                text_elem = structure.find('ns:Texto', self.NS)
+                raw_text = (
+                    self._extract_text_without_binaries(text_elem)
+                    if text_elem is not None else ''
+                )
+                is_truncated = self.is_part_truncated(raw_text) if text_elem is not None else False
+
+                # PR6 observability. Measured on the SAME raw text that
+                # extract_article_texts() strips to build this part's chunk, so the numbers
+                # describe the text that actually shipped. Observation only: the heuristic
+                # is untouched and the extracted text is byte-identical.
+                margin_note_stats = (
+                    self.strip_margin_notes_with_stats(raw_text)[1]
+                    if text_elem is not None else self.empty_margin_note_stats()
+                )
+
                 hierarchy[id_parte] = {
                     'article_number': article_number,
                     'article_label': article_label,
@@ -647,6 +1078,12 @@ class BCNXMLParser:
                     'in_force': in_force,
                     'version_date': version_date_str,
                     'is_transitory': is_transitory,
+                    'content_type': (
+                        self.CONTENT_TYPE_TRANSITORY if is_transitory
+                        else self.CONTENT_TYPE_ARTICLE
+                    ),
+                    'is_truncated': is_truncated,
+                    'margin_notes': margin_note_stats,
                 }
 
             # Extract treaty annexes (Tratados internacionales)
@@ -666,6 +1103,19 @@ class BCNXMLParser:
 
                 annex_key = f"anexo_{id_parte}"
 
+                # PR6: measured, unlike is_truncated above. Annexes are outside the
+                # truncation semantics, but they ARE stripped -- extract_article_texts()
+                # runs _strip_margin_notes() over every annex body -- so an annex can lose
+                # table rows or enumerations to the heuristic and that loss must be
+                # visible. Measuring it is not implementing annex handling; PR7 owns that.
+                annex_text_elem = annex.find('ns:Texto', self.NS)
+                annex_margin_notes = (
+                    self.strip_margin_notes_with_stats(
+                        self._extract_text_without_binaries(annex_text_elem)
+                    )[1]
+                    if annex_text_elem is not None else self.empty_margin_note_stats()
+                )
+
                 hierarchy[annex_key] = {
                     'article_number': None,
                     'article_label': 'Anexo',
@@ -677,7 +1127,20 @@ class BCNXMLParser:
                     'in_force': in_force,
                     'version_date': version_date_str,
                     'is_transitory': False,
+                    'content_type': self.CONTENT_TYPE_ANNEX,
+                    # PR5: annexes are outside the truncation semantics -- the repair path
+                    # only ever looks at tipoParte Articulo / Disposicion Transitoria -- so
+                    # the flag is stated as False rather than measured with a predicate that
+                    # was never validated against annex bodies.
+                    'is_truncated': False,
+                    'margin_notes': annex_margin_notes,
                 }
+
+            # Promulgation closes the document, so it goes last.
+            for part in self._extract_synthetic_parts(root, norm_id):
+                if part['content_type'] != self.CONTENT_TYPE_PROMULGATION:
+                    continue
+                hierarchy[part['key']] = self._synthetic_hierarchy_entry(part)
 
             logger.info(
                 "hierarchy_extracted",
@@ -865,19 +1328,32 @@ class BCNXMLParser:
         full_text = ''.join(text_parts).strip()
         return full_text
 
-    def extract_article_texts(self, xml_content: str) -> Dict[str, str]:
+    def extract_article_texts(
+        self, xml_content: str, norm_id: Optional[int] = None
+    ) -> Dict[str, str]:
         """
         Extract article texts from XML.
 
-        Returns dict mapping idParte -> article text.
+        Returns dict mapping idParte -> article text, in reading order: header, articles,
+        annexes, promulgation. The chunker iterates this dict, so insertion order is what
+        determines chunk order.
 
-        This is what the chunker will use.
+        Args:
+            xml_content: XML string
+            norm_id: Only used to build synthetic keys when the XML lacks normaId;
+                     optional so existing callers keep working unchanged.
 
         IMPORTANT: Removes binary attachments (images) that BCN includes inline.
         """
         try:
             root = ET.fromstring(xml_content)
             article_texts = {}
+
+            synthetic_parts = self._extract_synthetic_parts(root, norm_id)
+
+            for part in synthetic_parts:
+                if part['content_type'] == self.CONTENT_TYPE_HEADER:
+                    article_texts[part['key']] = part['text']
 
             for structure in self._find_article_structures(root):
                 id_parte = structure.get('idParte')
@@ -893,26 +1369,22 @@ class BCNXMLParser:
                         article_texts[id_parte] = text
 
             # Extract treaty annex texts
-            # Annexes contain full treaty text that would otherwise be missed
-            for annex in root.findall('.//ns:Anexo', self.NS):
-                id_parte = annex.get('idParte')
-                if not id_parte:
-                    continue
+            # Annexes contain full treaty text that would otherwise be missed.
+            # PR11: this loop moved verbatim into _extract_annex_parts() so that
+            # _extract_full_content() can store the same text instead of re-deriving it.
+            # Keys, order and skipping rules are unchanged.
+            for part in self._extract_annex_parts(root):
+                article_texts[part['key']] = part['text']
 
-                # Get text element
-                text_elem = annex.find('ns:Texto', self.NS)
-                if text_elem is not None:
-                    # Extract all text, skipping binary attachments and margin notes
-                    text = self._strip_margin_notes(self._extract_text_without_binaries(text_elem))
-                    if text:
-                        # Use same special key as in hierarchy
-                        annex_key = f"anexo_{id_parte}"
-                        article_texts[annex_key] = text
+            for part in synthetic_parts:
+                if part['content_type'] == self.CONTENT_TYPE_PROMULGATION:
+                    article_texts[part['key']] = part['text']
 
             logger.debug(
                 "article_texts_extracted",
                 total_articles=len(article_texts),
-                annexes=sum(1 for k in article_texts.keys() if k.startswith('anexo_'))
+                annexes=sum(1 for k in article_texts.keys() if k.startswith('anexo_')),
+                synthetic_parts=len(synthetic_parts),
             )
 
             return article_texts

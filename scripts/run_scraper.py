@@ -35,6 +35,7 @@ from pipeline.norm_tracker import NormTracker  # Direct import, bypasses __init_
 from pipeline.chunker import ProfessionalChunker
 from storage.s3_client import S3Storage  # Direct import, bypasses __init__
 from core.models import ChileanLegalNorm
+from core.version import PARSER_VERSION
 
 # Configure structured logging
 structlog.configure(
@@ -210,10 +211,24 @@ class ProductionScraper:
             try:
                 # Extract article metadata from XML
                 hierarchy = self.xml_parser.extract_article_hierarchy(xml_content, norm.norm_id)
-                article_texts = self.xml_parser.extract_article_texts(xml_content)
+                article_texts = self.xml_parser.extract_article_texts(xml_content, norm.norm_id)
 
-                total_articles = len(hierarchy)
-                vigentes = sum(1 for info in hierarchy.values() if info.get('in_force', True))
+                # Header and promulgation are structural content, not articles (PR3).
+                # They are excluded here so total_articles/vigentes keep exactly the
+                # meaning they had before PR3 (annexes still count, as they always did).
+                SYNTHETIC_CONTENT_TYPES = {
+                    self.xml_parser.CONTENT_TYPE_HEADER,
+                    self.xml_parser.CONTENT_TYPE_PROMULGATION,
+                }
+                article_parts = {
+                    part_id: info for part_id, info in hierarchy.items()
+                    if info.get('content_type') not in SYNTHETIC_CONTENT_TYPES
+                }
+
+                total_articles = len(article_parts)
+                vigentes = sum(
+                    1 for info in article_parts.values() if info.get('in_force', True)
+                )
 
                 # Extract global in_force status
                 norm_in_force = self.xml_parser.extract_norm_vigencia(xml_content)
@@ -230,8 +245,11 @@ class ProductionScraper:
                     "common_name": norm.common_name,
                 }
 
+                # PR9: routing/fallback text, NOT the stored `full_content`. Same string
+                # today; separate so that completing `full_content` later cannot change
+                # routing or chunks by accident.
                 chunks = self.chunker.chunk(
-                    norm.full_content,
+                    norm.chunking_text,
                     metadata=metadata,
                     xml_content=xml_content,
                     norm_id=norm.norm_id
@@ -266,6 +284,7 @@ class ProductionScraper:
             "subject_tags": norm.subject_tags,
             "common_name": norm.common_name,
             "source": "xml",
+            "parser_version": PARSER_VERSION,
             "full_content": norm.full_content,
         }
 
@@ -383,8 +402,16 @@ class ProductionScraper:
         metadata = {
             "instance_id": self.instance_id,
             "source": "bcn-scraper-xml",
-            "has_chunks": str(data.get("total_chunks", 0) > 0).lower()
+            "has_chunks": str(data.get("total_chunks", 0) > 0).lower(),
+            "parser_version": PARSER_VERSION,
         }
+
+        # Persist the POST-REPAIR XML: the exact input the parser saw. Stored before
+        # the JSON so a crash never leaves output without its input, and kept
+        # non-fatal because S3 presence of the JSON is the success source of truth --
+        # a missing XML must not turn a good norm into a failure.
+        if xml_content:
+            self._store_xml(doc_id, norm.norm_id, xml_content)
 
         success = self.s3_storage.store_document(key, data, metadata)
 
@@ -399,6 +426,38 @@ class ProductionScraper:
                 "norm_storage_failed",
                 norm_id=norm.norm_id,
                 key=key,
+            )
+
+    def _store_xml(self, doc_id: str, norm_id: int, xml_content: str) -> None:
+        """
+        Upload the post-repair XML used by the parser.
+
+        Failures are logged and swallowed on purpose: the XML is for reprocessing and
+        forensics, not for correctness of the current document.
+        """
+        xml_key = self.s3_storage.build_xml_key(
+            knowledge_id=self.config.lexintel.knowledge_id,
+            doc_id=doc_id,
+        )
+
+        stored = self.s3_storage.store_xml(
+            xml_key,
+            xml_content,
+            metadata={
+                "instance_id": self.instance_id,
+                "parser_version": PARSER_VERSION,
+                "post_repair": "true",
+            },
+        )
+
+        if stored:
+            logger.debug("xml_stored_s3", norm_id=norm_id, key=xml_key)
+        else:
+            logger.warning(
+                "xml_storage_failed",
+                norm_id=norm_id,
+                key=xml_key,
+                note="Document JSON is unaffected; norm is not marked failed",
             )
 
     def get_resume_point(self) -> int | None:

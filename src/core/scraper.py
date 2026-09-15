@@ -46,19 +46,10 @@ class BCNPlaywrightScraper:
         re.DOTALL,
     )
     _ATTR_PATTERN = re.compile(r'(\w+)="([^"]*)"')
-    # Editorial notes are appended after the body, behind a bare "NOTA" line
-    _NOTE_BLOCK_PATTERN = re.compile(r'\n[ \t]*\n[ \t]*NOTAS?[ \t]*\n')
-    # A complete Chilean legal article always closes on sentence-terminating
-    # punctuation. Note that "º" is excluded on purpose: Art. 19 truncates on a
-    # dangling "20º", which would otherwise look like a legitimate ending.
-    _SENTENCE_TERMINATORS = '.;:!?)"”'
     _REPAIRABLE_PART_TYPES = {"Artículo", "Disposición Transitoria"}
-    # Repealed articles are legitimately a bare marker with no closing period
-    _REPEAL_MARKER_PATTERN = re.compile(
-        r'^\s*(?:Art\S*\s*[\wº°.\-]*\s*[.\-]*\s*)?'
-        r'(?:Derogado|Suprimido|Eliminado|Sin efecto)\s*\.?\s*$',
-        re.IGNORECASE,
-    )
+    # The truncation rules themselves (note block, sentence terminators, repeal markers)
+    # live in BCNXMLParser as of PR5, so this repair path and the per-part flag the
+    # parser stores cannot disagree. See BCNXMLParser.is_part_truncated().
 
     def __init__(self, config: ScraperConfig):
         self.config = config
@@ -147,23 +138,18 @@ class BCNPlaywrightScraper:
 
     def _split_note_block(self, text: str) -> tuple:
         """Splits an article's <Texto> into (body, editorial_note_block)."""
-        match = self._NOTE_BLOCK_PATTERN.search(text)
-        if not match:
-            return text, ""
-        return text[:match.start()], text[match.start():]
+        return self.xml_parser._split_note_block(text)
 
     def _is_truncated(self, raw_text: str) -> bool:
         """
         True if an article's text was cut off mid-sentence.
 
-        Margin notes are stripped first, otherwise the trailing amendment
-        reference in the right-hand column would look like the end of the text.
+        PR5 moved the rules to BCNXMLParser.is_part_truncated() so the repair path here
+        and the per-part instrumentation in the parser cannot drift apart. Behavior is
+        unchanged; this stays as the name the repair helpers (and the audit scripts in
+        .audit/) already call.
         """
-        body, _ = self._split_note_block(html.unescape(raw_text))
-        body = self.xml_parser._strip_margin_notes(body).strip()
-        if not body or self._REPEAL_MARKER_PATTERN.match(body):
-            return False
-        return body[-1] not in self._SENTENCE_TERMINATORS
+        return self.xml_parser.is_part_truncated(raw_text)
 
     def _iter_repairable_articles(self, xml_content: str):
         """Yields (part_id, match) for article-like parts that can be repaired."""
