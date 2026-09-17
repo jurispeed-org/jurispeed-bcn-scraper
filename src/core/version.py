@@ -94,6 +94,76 @@ History:
             of the sub-parts among themselves are untouched -- including the known
             "Articulo 17 before Articulo 1" false positive, deliberately left alone.
             242302 does NOT change again, so the golden moves only by this version string.
+    1.10.0 - PR13: the same-line margin-note rule stops deleting substantive document text.
+            _MARGIN_NOTE_PATTERN (`(?<=\S) {4,}\S.*$`) was purely GEOMETRIC: 4+ spaces after
+            any non-space, then everything to end of line, with no test of WHAT was deleted.
+            The whole-line rule (_is_note_only_line) always demanded note vocabulary first;
+            that asymmetry was the bug, because BCN's whitespace is also list indentation,
+            table column alignment and key/value padding. New _is_margin_note_tail() applies
+            the evidence test the whole-line rule already had: a strong note signature, or a
+            tail <= 60 chars that contains a note keyword and consists only of note
+            vocabulary. The 60-char bound also keeps _NOTE_ONLY_LINE_PATTERN off long
+            strings, where it backtracks catastrophically (measured 1.1s at 2,000 chars).
+            MONOTONIC: the predicate can only KEEP text the previous rule removed, never
+            remove anything new, which is what bounds this change. Measured words recovered
+            per norm, 1.9.0 vs now: 198321 27,904; 8043 5,066; 17297 1,559; 249140 757;
+            1004655 444; 243386 287; 284068 244; 1200724 15; 242302 151.
+            Content grows; STRUCTURE does not. total_chunks, total_articles, vigentes and the
+            routing branch are IDENTICAL on all 12 committed XMLs (4 change text, 8 are
+            byte-identical); 242302 keeps 434 chunks, of which 66 grow, over 60 of 228 parts.
+            chunking_text also grows, so this is a routing-INPUT change and no branch flip was
+            observed -- but none is excluded outside those 12 documents.
+            NOT fixed, deliberately, and recorded in docs/KNOWN_BUGS.md: _DEEP_INDENT_NOTE_
+            PATTERN still deletes whole table rows indented past column 40; 242302 retains
+            116 occurrences of note debris ('1o' x25, 'DISPOSICION' x20, 'TRANSITORIA.' x10),
+            so for that norm this PR is a note-stripping precision regression rather than a
+            content recovery; and that debris leaves 3 parts (8563639, 8563643, 8563645)
+            ending without terminating punctuation, which is_part_truncated() therefore flags
+            as false positives. A tail-COLUMN gate (col >= 40) was measured and REJECTED: it
+            would delete 1,225 tariff-table cells in norm 198321.
+            Corpus-wide effect is UNMEASURED: the claim here is "mechanism fixed and
+            demonstrated on 9 real norms", not "corpus-wide content loss fixed".
+    1.11.0 - PR14: the deep-indent margin-note rule stops deleting document content. This is
+            the one PR13 named as NOT fixed. _DEEP_INDENT_NOTE_PATTERN (`^ {40,}\\S`) deleted
+            the WHOLE line on geometry alone, on the reasoning that body text never starts past
+            column 20. Measured over the FULL population of lines it removes -- 710 lines, 54
+            documents, 1,337 words, read from the persisted post-repair XML of every tier1b
+            decreto with deep_indent_lines > 0, `.audit/pr14_deep_indent/` -- that band is not
+            empty: BCN's note column is a fixed x-position per document, at indent 66 or 68 in
+            all 54, while table columns, wrapped column headers and narrow prose columns reach
+            indent 40-53. 290 of the 710 lines (406 words) are document content.
+            The rule is unchanged; a new predicate _is_deep_indent_note() is ANDed onto it:
+            indent >= 60 AND (_is_margin_note_tail(body) OR a bare editorial marker,
+            NOTA / NOTA 1 / VER NOTAS). A column test alone was measured and is NOT sufficient
+            -- norm 256759 puts a real customs-tariff column header ("Estad.") at indent 66,
+            inside the note column -- so the discriminating signal is the note column's bounded
+            vocabulary, i.e. the same evidence test PR13 gave the same-line rule.
+            _is_margin_note_tail, _DEEP_INDENT_NOTE_PATTERN, _NOTE_ONLY_LINE_PATTERN, the
+            continuation rule, truncation detection, routing and chunking are all untouched.
+            MONOTONIC, as in PR13 and for the same structural reason: PR14 only ADDS a
+            condition to an existing delete branch, so it can only convert deletions into
+            preservations and can never newly delete anything, for ANY input. Asserted as an
+            executable property against the verbatim previous behaviour in
+            tests/test_deep_indent_content_preservation.py (26 tests).
+            Measured over the 710 lines: 351 lines / 524 words stop being deleted, of which
+            271/356 are table content, 17/46 wrapped prose, 2/4 a heading -- and 61/118 are
+            retained NOTE DEBRIS, not content. 359 lines / 813 words are still deleted, all of
+            them classified margin notes. Zero classified content lines are deleted; zero
+            content lines are newly deleted. On 242302 the whole 896-char gain is debris.
+            Structure does not move: conservation ran the production path both ways per norm
+            over the population (`.audit/pr14_conservation.py`) and found no part, chunk or
+            metadata key lost, no ordering change, no XML-route or _detect_articles flip, and
+            no total_articles/vigentes change. All 37 norms with preserved lines take the XML
+            route, so the routing text is not read for them. On the 12 committed XMLs
+            total_chunks, total_articles and vigentes are identical and only 242302 changes
+            text; chunking_text grows on 242302 (368,617 -> 369,513), so this is still a
+            routing-INPUT change and no branch flip was observed -- none is excluded elsewhere.
+            NOT fixed, deliberately: note debris in general (the 61 retained lines above, and
+            242302's pre-existing debris), which is why 242302's is_truncated set moves from
+            {8563618, 8563639, 8563643, 8563645} to {8563618, 8563633, 8563643} -- 3 debris
+            false positives become 2, observability only, no stored text lost either way.
+            Corpus-wide effect is UNMEASURED. The evidence covers the 54 measured decretos and
+            the 12 committed XMLs; it supports no claim beyond them.
 """
 
-PARSER_VERSION = "1.9.0"
+PARSER_VERSION = "1.11.0"

@@ -62,6 +62,27 @@ class BCNXMLParser:
     # the wrapped note fragments that are too generic for the vocabulary rules
     # below ("letra a) D.O.", "Nº 3 letra a)").
     _DEEP_INDENT_NOTE_PATTERN = re.compile(r'^ {40,}\S')
+    # PR14. The band above turned out not to be empty. Measured over the full population of
+    # lines this rule removes (710 lines, 54 documents, .audit/pr14_deep_indent/): BCN's note
+    # column is a fixed x-position per document, at indent 66 or 68 in every one of them, while
+    # table columns, wrapped column headers and narrow prose columns reach indent 40-53. So
+    # column 40 is ~26 columns below the note column and the rule was deleting document
+    # content: 290 of the 710 lines (406 words) are table cells, wrapped headers, wrapped prose
+    # or an annex heading.
+    # A column test alone still cannot be used: norm 256759 puts a real customs-tariff column
+    # header ("Estad.", the wrapped third line of "... Unidad / Codigo / Estad.") at indent 66,
+    # inside the note column, and a >= 60 rule alone deletes it. The discriminating signal is
+    # the note column's bounded VOCABULARY, so the geometric test is combined with the same
+    # evidence test PR13 gave the same-line rule. Measured on those 710 lines: zero of the 266
+    # content lines below the column match _is_margin_note_tail, and every note verdict it
+    # returns sits at indent >= 60.
+    # Ordering is load-bearing, for the reason recorded on _MAX_MARGIN_NOTE_TAIL_CHARS: the
+    # cheap column test must run before _NOTE_ONLY_LINE_PATTERN can be reached.
+    _DEEP_INDENT_MIN_COLUMN = 60
+    # BCN also parks a bare editorial marker in that column ("NOTA", "NOTA 1", "VER NOTAS"),
+    # which carries no note vocabulary at all. Without this arm PR14 would stop deleting 42
+    # further note lines. It is not a note-debris fix; it keeps PR14 from ADDING debris.
+    _BARE_NOTE_MARKER_PATTERN = re.compile(r'(?:VER\s+)?NOTAS?(?:\s*\d+)?\.?')
     _NOTE_ONLY_LINE_PATTERN = re.compile(
         r'^[ \t]*(?:'
         r'CPR|LEY|D\.\s*O\.|Art\.?|N[°º]|[úu]nico|inciso|letra|numeral|transitorio'
@@ -82,6 +103,85 @@ class BCNXMLParser:
         r')+$',
         re.IGNORECASE,
     )
+
+    # A margin note lives in a fixed-width column on the right of the page, so it is SHORT.
+    # Measured over the committed XML corpus plus norm 242302: signature-bearing tails run
+    # 4-19 characters, note-vocabulary tails 1-18, and not one legitimate note tail exceeds
+    # 22. 60 therefore sits far above every observed note while staying far below the body
+    # text this rule was deleting (83-word tails in norm 1004655).
+    # The bound is also load-bearing for a second reason: _NOTE_ONLY_LINE_PATTERN is a
+    # `(?:alt|alt|[ \t])+$` construction, which backtracks catastrophically when it fails on a
+    # long string (measured: 1.1s at 2,000 characters, no result at 20,000). Production never
+    # hit that because _is_note_only_line() short-circuits before reaching it. Testing a tail
+    # for note vocabulary re-opens that path, so the length check must come first.
+    _MAX_MARGIN_NOTE_TAIL_CHARS = 60
+    # _NOTE_ONLY_LINE_PATTERN tolerates `[\d.]+` and bare punctuation, because a note
+    # CONTINUATION legitimately looks like "1° N° 23" once its keyword is on the line above.
+    # Applied to a same-line tail with no such context, that tolerance is not evidence: it
+    # accepts a numeric table cell ("126049          607534") and a key/value tail
+    # (": 7.123.456-8" after "RUN"), both of which are document content. So the vocabulary
+    # arm additionally requires one actual note keyword to be present.
+    _NOTE_KEYWORD = re.compile(
+        r'CPR|LEY|D\.\s*O\.|Art\.?|N[°º]|inciso|letra|numeral|transitorio|[úu]nico|bis',
+        re.IGNORECASE,
+    )
+
+    def _is_margin_note_tail(self, tail: str) -> bool:
+        """
+        Does the text after a wide space run actually look like BCN's amendment column?
+
+        PR13. The same-line rule used to be purely geometric: _MARGIN_NOTE_PATTERN deletes a
+        4+ space run and everything after it, whatever that text is. Whitespace in BCN's
+        export is not exclusively a column separator -- it is also list indentation, table
+        column alignment and key/value padding -- so the rule removed substantive document
+        text. Measured cases: Article 8 of the Estatuto de Roma reduced to its enumerator
+        ("v)"), whole numbered paragraphs of norm 249140 reduced to "1.", substance names in
+        the hazardous-waste table of norm 243386, and the values of "Grado" / "RUN" in a
+        naval appointment decree.
+
+        The asymmetry this fixes: the WHOLE-line rule (_is_note_only_line) already demanded
+        note vocabulary before deleting anything. The same-line rule demanded nothing. This
+        applies the evidence test the whole-line rule always had.
+
+        A tail is a note when it carries a strong note signature ("CPR Art.", "LEY N° 20.050",
+        "D.O.", a dd.mm.yyyy date), or when it is short enough to fit the margin column and
+        consists only of note vocabulary -- which is how a wrapped note fragment such as
+        "Art 1° N° 23 letra c)" appears.
+
+        This predicate can only ever KEEP text the previous code removed; it never removes
+        anything new. That is the property that bounds this change.
+        """
+        text = tail.strip()
+        if not text:
+            return False
+        if self._NOTE_STRONG_SIGNATURE.search(text):
+            return True
+        if len(text) > self._MAX_MARGIN_NOTE_TAIL_CHARS:
+            return False
+        if not self._NOTE_KEYWORD.search(text):
+            return False
+        return bool(self._NOTE_ONLY_LINE_PATTERN.match(text))
+
+    def _is_deep_indent_note(self, line: str) -> bool:
+        """
+        Is a deeply indented line actually BCN's amendment column, or just far-right layout?
+
+        PR14. _DEEP_INDENT_NOTE_PATTERN is geometric and tests nothing about what it deletes;
+        this adds the evidence test. A deep-indented line is a note when it starts at or past
+        the measured note column AND either reads as a note tail (PR13's predicate, unchanged)
+        or is the bare editorial marker BCN puts in the same column.
+
+        Like _is_margin_note_tail, this can only ever KEEP text the previous code removed. It
+        is an additional condition on an existing delete branch, so it cannot remove anything
+        new, for any input -- that is what bounds the change.
+        """
+        body = line.strip()
+        if not body:
+            return False
+        if len(line) - len(line.lstrip(' ')) < self._DEEP_INDENT_MIN_COLUMN:
+            return False
+        return (self._is_margin_note_tail(body)
+                or bool(self._BARE_NOTE_MARKER_PATTERN.fullmatch(body)))
 
     def _is_note_only_line(self, line: str) -> bool:
         if not line.strip() or not self._NOTE_STRONG_SIGNATURE.search(line):
@@ -234,7 +334,8 @@ class BCNXMLParser:
         in_note = False
 
         for line_number, line in enumerate(text.split('\n')):
-            if self._DEEP_INDENT_NOTE_PATTERN.match(line):
+            if (self._DEEP_INDENT_NOTE_PATTERN.match(line)
+                    and self._is_deep_indent_note(line)):
                 record(self.REASON_DEEP_INDENT, line, line_number)
                 in_note = True
                 continue
@@ -249,6 +350,12 @@ class BCNXMLParser:
                 continue
 
             stripped = self._MARGIN_NOTE_PATTERN.sub('', line)
+            # PR13: the pattern finding a wide space run is not sufficient evidence that what
+            # follows is a note. Unless the tail looks like one, keep the line whole -- the
+            # gap is layout (list indentation, table columns, key/value padding), not a
+            # column separator.
+            if stripped != line and not self._is_margin_note_tail(line[len(stripped):]):
+                stripped = line
             if stripped != line:
                 record(self.REASON_SAME_LINE, line[len(stripped):], line_number)
             # A same-line note also opens a note block: its wrapped tail lands on
